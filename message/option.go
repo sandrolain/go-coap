@@ -75,7 +75,12 @@ const (
 	ProxyURI      OptionID = 35
 	ProxyScheme   OptionID = 39
 	Size1         OptionID = 60
+	HopLimit      OptionID = 16
+	Echo          OptionID = 252
 	NoResponse    OptionID = 258
+	RequestTag    OptionID = 292
+	QBlock1       OptionID = 2048
+	QBlock2       OptionID = 2049
 )
 
 var optionIDToString = map[OptionID]string{
@@ -98,7 +103,12 @@ var optionIDToString = map[OptionID]string{
 	ProxyURI:      "ProxyURI",
 	ProxyScheme:   "ProxyScheme",
 	Size1:         "Size1",
+	HopLimit:      "HopLimit",
+	Echo:          "Echo",
 	NoResponse:    "NoResponse",
+	RequestTag:    "RequestTag",
+	QBlock1:       "QBlock1",
+	QBlock2:       "QBlock2",
 }
 
 func (o OptionID) String() string {
@@ -155,7 +165,12 @@ var CoapOptionDefs = map[OptionID]OptionDef{
 	ProxyURI:      {ValueFormat: ValueString, MinLen: 1, MaxLen: 1034},
 	ProxyScheme:   {ValueFormat: ValueString, MinLen: 1, MaxLen: 255},
 	Size1:         {ValueFormat: ValueUint, MinLen: 0, MaxLen: 4},
+	HopLimit:      {ValueFormat: ValueUint, MinLen: 1, MaxLen: 1},
+	Echo:          {ValueFormat: ValueOpaque, MinLen: 1, MaxLen: 40},
 	NoResponse:    {ValueFormat: ValueUint, MinLen: 0, MaxLen: 1},
+	RequestTag:    {ValueFormat: ValueOpaque, MinLen: 0, MaxLen: 8},
+	QBlock1:       {ValueFormat: ValueUint, MinLen: 0, MaxLen: 3},
+	QBlock2:       {ValueFormat: ValueUint, MinLen: 0, MaxLen: 3},
 }
 
 // MediaType specifies the content format of a message.
