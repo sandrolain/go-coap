@@ -342,6 +342,37 @@ func TestPathOption(t *testing.T) {
 	}
 }
 
+func TestPathInvalidUTF8(t *testing.T) {
+	// Create options with invalid UTF-8 bytes directly in URIPath value
+	opts := Options{
+		{ID: URIPath, Value: []byte{0xff, 0xfe}},
+	}
+	_, err := opts.Path()
+	require.ErrorIs(t, err, ErrInvalidUTF8)
+}
+
+func TestLocationPathInvalidUTF8(t *testing.T) {
+	opts := Options{
+		{ID: LocationPath, Value: []byte("valid")},
+		{ID: LocationPath, Value: []byte{0x80, 0x81}},
+	}
+	_, err := opts.LocationPath()
+	require.ErrorIs(t, err, ErrInvalidUTF8)
+}
+
+func TestPathValidUTF8(t *testing.T) {
+	// Valid UTF-8 including multi-byte characters
+	opts := make(Options, 0, 10)
+	path := "/café/日本語"
+	buf := make([]byte, 256)
+	opts, _, err := opts.SetPath(buf, path)
+	require.NoError(t, err)
+
+	newPath, err := opts.Path()
+	require.NoError(t, err)
+	require.Equal(t, path, newPath)
+}
+
 func TestQueryOption(t *testing.T) {
 	v := "if=oic.if.baseline"
 	buf := make([]byte, len(v))
