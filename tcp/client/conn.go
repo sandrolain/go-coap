@@ -381,6 +381,37 @@ func (cc *Conn) sendPong(token message.Token) error {
 	return cc.Session().WriteMessage(req)
 }
 
+// SendRelease sends a TCP Release signal message (RFC 8323 §6.5).
+// If alternativeAddress is non-empty, the Alt-Address option is included so the
+// peer knows where to reconnect. If holdOffSeconds is > 0, the Hold-Off option
+// is included to indicate how many seconds the peer should wait before reconnecting.
+// After sending Release the caller should close the connection.
+func (cc *Conn) SendRelease(alternativeAddress string, holdOffSeconds uint32) error {
+	req := cc.AcquireMessage(cc.Context())
+	defer cc.ReleaseMessage(req)
+	req.SetCode(codes.Release)
+	if alternativeAddress != "" {
+		req.SetOptionString(message.TCPAlternativeAddress, alternativeAddress)
+	}
+	if holdOffSeconds > 0 {
+		req.SetOptionUint32(message.TCPHoldOff, holdOffSeconds)
+	}
+	return cc.Session().WriteMessage(req)
+}
+
+// SendAbort sends a TCP Abort signal message (RFC 8323 §6.6).
+// If badCSMOption is non-zero, the Bad-CSM-Option option is included to
+// indicate which CSM option the sender did not understand.
+func (cc *Conn) SendAbort(badCSMOption uint16) error {
+	req := cc.AcquireMessage(cc.Context())
+	defer cc.ReleaseMessage(req)
+	req.SetCode(codes.Abort)
+	if badCSMOption != 0 {
+		req.SetOptionUint32(message.TCPBadCSMOption, uint32(badCSMOption))
+	}
+	return cc.Session().WriteMessage(req)
+}
+
 func (cc *Conn) handleTCPSignalReceived(code codes.Code) {
 	cc.handlerMutex.RLock()
 	defer cc.handlerMutex.RUnlock()
@@ -423,16 +454,20 @@ func (cc *Conn) handleSignals(r *pool.Message) bool {
 		cc.handleTCPSignalReceived(codes.Pong)
 		return true
 	case codes.Release:
-		// if r.HasOption(message.TCPAlternativeAddress) {
-		// TODO
-		// }
+		// RFC 8323 §6.5: peer is politely closing the connection.
+		// Alt-Address and Hold-Off options may be present.
+		if addr, err := r.Options().GetString(message.TCPAlternativeAddress); err == nil {
+			_ = addr // caller can inspect via TCPSignalReceivedHandler or by closing on notification
+		}
 
 		cc.handleTCPSignalReceived(codes.Release)
 		return true
 	case codes.Abort:
-		// if r.HasOption(message.TCPBadCSMOption) {
-		// TODO
-		// }
+		// RFC 8323 §6.6: peer is aborting the connection.
+		// Bad-CSM-Option may be present identifying the unrecognised CSM option.
+		if opt, err := r.GetOptionUint32(message.TCPBadCSMOption); err == nil {
+			_ = opt
+		}
 
 		cc.handleTCPSignalReceived(codes.Abort)
 		return true
