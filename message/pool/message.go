@@ -595,6 +595,45 @@ func (r *Message) SetupDelete(path string, token message.Token, opts ...message.
 	return r.setupCommon(codes.DELETE, path, token, opts...)
 }
 
+// SetupFetch prepares a FETCH request (RFC 8132).
+// FETCH is a safe, idempotent method for fetching a resource with a request body.
+func (r *Message) SetupFetch(path string, token message.Token, contentFormat message.MediaType, payload io.ReadSeeker, opts ...message.Option) error {
+	if err := r.setupCommon(codes.FETCH, path, token, opts...); err != nil {
+		return err
+	}
+	if payload != nil {
+		r.SetContentFormat(contentFormat)
+		r.SetBody(payload)
+	}
+	return nil
+}
+
+// SetupPatch prepares a PATCH request (RFC 8132).
+// PATCH applies a partial update to a resource.
+func (r *Message) SetupPatch(path string, token message.Token, contentFormat message.MediaType, payload io.ReadSeeker, opts ...message.Option) error {
+	if err := r.setupCommon(codes.PATCH, path, token, opts...); err != nil {
+		return err
+	}
+	if payload != nil {
+		r.SetContentFormat(contentFormat)
+		r.SetBody(payload)
+	}
+	return nil
+}
+
+// SetupIPatch prepares an iPATCH request (RFC 8132).
+// iPATCH applies a partial, idempotent update to a resource.
+func (r *Message) SetupIPatch(path string, token message.Token, contentFormat message.MediaType, payload io.ReadSeeker, opts ...message.Option) error {
+	if err := r.setupCommon(codes.IPATCH, path, token, opts...); err != nil {
+		return err
+	}
+	if payload != nil {
+		r.SetContentFormat(contentFormat)
+		r.SetBody(payload)
+	}
+	return nil
+}
+
 func (r *Message) Clone(msg *Message) error {
 	msg.SetCode(r.Code())
 	msg.SetToken(r.Token())

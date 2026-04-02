@@ -216,6 +216,109 @@ func (c *Client[C]) Delete(ctx context.Context, path string, opts ...message.Opt
 	return c.Do(req)
 }
 
+// NewFetchRequest creates a FETCH request (RFC 8132).
+//
+// Use ctx to set timeout.
+// If payload is nil then content format is not used.
+func (c *Client[C]) NewFetchRequest(ctx context.Context, path string, contentFormat message.MediaType, payload io.ReadSeeker, opts ...message.Option) (*pool.Message, error) {
+	req := c.cc.AcquireMessage(ctx)
+	token, err := c.GetToken()
+	if err != nil {
+		c.cc.ReleaseMessage(req)
+		return nil, err
+	}
+	if err = req.SetupFetch(path, token, contentFormat, payload, opts...); err != nil {
+		c.cc.ReleaseMessage(req)
+		return nil, err
+	}
+	return req, nil
+}
+
+// Fetch issues a FETCH to the specified path (RFC 8132).
+//
+// Use ctx to set timeout.
+// FETCH is a safe, idempotent method that retrieves a resource representation
+// based on a request body (e.g. a filter or query description).
+//
+// An error is returned if by failure to speak COAP (such as a network connectivity problem).
+// Any status code doesn't cause an error.
+func (c *Client[C]) Fetch(ctx context.Context, path string, contentFormat message.MediaType, payload io.ReadSeeker, opts ...message.Option) (*pool.Message, error) {
+	req, err := c.NewFetchRequest(ctx, path, contentFormat, payload, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create fetch request: %w", err)
+	}
+	defer c.cc.ReleaseMessage(req)
+	return c.Do(req)
+}
+
+// NewPatchRequest creates a PATCH request (RFC 8132).
+//
+// Use ctx to set timeout.
+// If payload is nil then content format is not used.
+func (c *Client[C]) NewPatchRequest(ctx context.Context, path string, contentFormat message.MediaType, payload io.ReadSeeker, opts ...message.Option) (*pool.Message, error) {
+	req := c.cc.AcquireMessage(ctx)
+	token, err := c.GetToken()
+	if err != nil {
+		c.cc.ReleaseMessage(req)
+		return nil, err
+	}
+	if err = req.SetupPatch(path, token, contentFormat, payload, opts...); err != nil {
+		c.cc.ReleaseMessage(req)
+		return nil, err
+	}
+	return req, nil
+}
+
+// Patch issues a PATCH to the specified path (RFC 8132).
+//
+// Use ctx to set timeout.
+// PATCH applies a partial update as described in the request body.
+//
+// An error is returned if by failure to speak COAP (such as a network connectivity problem).
+// Any status code doesn't cause an error.
+func (c *Client[C]) Patch(ctx context.Context, path string, contentFormat message.MediaType, payload io.ReadSeeker, opts ...message.Option) (*pool.Message, error) {
+	req, err := c.NewPatchRequest(ctx, path, contentFormat, payload, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create patch request: %w", err)
+	}
+	defer c.cc.ReleaseMessage(req)
+	return c.Do(req)
+}
+
+// NewIPatchRequest creates an iPATCH request (RFC 8132).
+//
+// Use ctx to set timeout.
+// If payload is nil then content format is not used.
+func (c *Client[C]) NewIPatchRequest(ctx context.Context, path string, contentFormat message.MediaType, payload io.ReadSeeker, opts ...message.Option) (*pool.Message, error) {
+	req := c.cc.AcquireMessage(ctx)
+	token, err := c.GetToken()
+	if err != nil {
+		c.cc.ReleaseMessage(req)
+		return nil, err
+	}
+	if err = req.SetupIPatch(path, token, contentFormat, payload, opts...); err != nil {
+		c.cc.ReleaseMessage(req)
+		return nil, err
+	}
+	return req, nil
+}
+
+// IPatch issues an iPATCH to the specified path (RFC 8132).
+//
+// Use ctx to set timeout.
+// iPATCH applies a partial, idempotent update to the resource.
+//
+// An error is returned if by failure to speak COAP (such as a network connectivity problem).
+// Any status code doesn't cause an error.
+func (c *Client[C]) IPatch(ctx context.Context, path string, contentFormat message.MediaType, payload io.ReadSeeker, opts ...message.Option) (*pool.Message, error) {
+	req, err := c.NewIPatchRequest(ctx, path, contentFormat, payload, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create ipatch request: %w", err)
+	}
+	defer c.cc.ReleaseMessage(req)
+	return c.Do(req)
+}
+
 // Ping issues a PING to the client and waits for PONG response.
 //
 // Use ctx to set timeout.

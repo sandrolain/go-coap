@@ -795,3 +795,309 @@ func TestClientKeepAliveMonitor(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, inactivityDetected.Load())
 }
+
+func TestConnFetch(t *testing.T) {
+	type args struct {
+		path          string
+		contentFormat message.MediaType
+		payload       io.ReadSeeker
+		opts          message.Options
+	}
+	tests := []struct {
+		name              string
+		args              args
+		wantCode          codes.Code
+		wantContentFormat *message.MediaType
+		wantPayload       interface{}
+		wantErr           bool
+	}{
+		{
+			name: "ok-a",
+			args: args{
+				path:          "/a",
+				contentFormat: message.TextPlain,
+				payload:       bytes.NewReader([]byte("fetch-query")),
+			},
+			wantCode:          codes.Content,
+			wantContentFormat: &message.TextPlain,
+			wantPayload:       []byte("fetch-response"),
+		},
+		{
+			name: "notfound",
+			args: args{
+				path:          "/c",
+				contentFormat: message.TextPlain,
+				payload:       bytes.NewReader([]byte("query")),
+			},
+			wantCode: codes.NotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l, err := coapNet.NewListenUDP("udp", "")
+			require.NoError(t, err)
+			defer func() {
+				errC := l.Close()
+				require.NoError(t, errC)
+			}()
+			var wg sync.WaitGroup
+			defer wg.Wait()
+
+			m := mux.NewRouter()
+			err = m.Handle("/a", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+				assert.Equal(t, codes.FETCH, r.Code())
+				ct, errH := r.Options().GetUint32(message.ContentFormat)
+				require.NoError(t, errH)
+				assert.Equal(t, message.TextPlain, message.MediaType(ct))
+				buf, errH := io.ReadAll(r.Body())
+				require.NoError(t, errH)
+				assert.Equal(t, []byte("fetch-query"), buf)
+				errH = w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("fetch-response")))
+				require.NoError(t, errH)
+			}))
+			require.NoError(t, err)
+
+			s := NewServer(options.WithMux(m))
+			defer s.Stop()
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errS := s.Serve(l)
+				assert.NoError(t, errS)
+			}()
+
+			cc, err := Dial(l.LocalAddr().String())
+			require.NoError(t, err)
+			defer func() {
+				errC := cc.Close()
+				require.NoError(t, errC)
+				<-cc.Done()
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*3600)
+			defer cancel()
+			got, err := cc.Fetch(ctx, tt.args.path, tt.args.contentFormat, tt.args.payload, tt.args.opts...)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantCode, got.Code())
+			if tt.wantContentFormat != nil {
+				ct, errC := got.ContentFormat()
+				require.NoError(t, errC)
+				require.Equal(t, *tt.wantContentFormat, ct)
+				buf := bytes.NewBuffer(nil)
+				_, errR := buf.ReadFrom(got.Body())
+				require.NoError(t, errR)
+				require.Equal(t, tt.wantPayload, buf.Bytes())
+			}
+		})
+	}
+}
+
+func TestConnPatch(t *testing.T) {
+	type args struct {
+		path          string
+		contentFormat message.MediaType
+		payload       io.ReadSeeker
+		opts          message.Options
+	}
+	tests := []struct {
+		name              string
+		args              args
+		wantCode          codes.Code
+		wantContentFormat *message.MediaType
+		wantPayload       interface{}
+		wantErr           bool
+	}{
+		{
+			name: "ok-a",
+			args: args{
+				path:          "/a",
+				contentFormat: message.TextPlain,
+				payload:       bytes.NewReader([]byte("patch-data")),
+			},
+			wantCode:          codes.Changed,
+			wantContentFormat: &message.TextPlain,
+			wantPayload:       []byte("patched"),
+		},
+		{
+			name: "notfound",
+			args: args{
+				path:          "/c",
+				contentFormat: message.TextPlain,
+				payload:       bytes.NewReader([]byte("data")),
+			},
+			wantCode: codes.NotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l, err := coapNet.NewListenUDP("udp", "")
+			require.NoError(t, err)
+			defer func() {
+				errC := l.Close()
+				require.NoError(t, errC)
+			}()
+			var wg sync.WaitGroup
+			defer wg.Wait()
+
+			m := mux.NewRouter()
+			err = m.Handle("/a", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+				assert.Equal(t, codes.PATCH, r.Code())
+				ct, errH := r.Options().GetUint32(message.ContentFormat)
+				require.NoError(t, errH)
+				assert.Equal(t, message.TextPlain, message.MediaType(ct))
+				buf, errH := io.ReadAll(r.Body())
+				require.NoError(t, errH)
+				assert.Equal(t, []byte("patch-data"), buf)
+				errH = w.SetResponse(codes.Changed, message.TextPlain, bytes.NewReader([]byte("patched")))
+				require.NoError(t, errH)
+			}))
+			require.NoError(t, err)
+
+			s := NewServer(options.WithMux(m))
+			defer s.Stop()
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errS := s.Serve(l)
+				assert.NoError(t, errS)
+			}()
+
+			cc, err := Dial(l.LocalAddr().String())
+			require.NoError(t, err)
+			defer func() {
+				errC := cc.Close()
+				require.NoError(t, errC)
+				<-cc.Done()
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*3600)
+			defer cancel()
+			got, err := cc.Patch(ctx, tt.args.path, tt.args.contentFormat, tt.args.payload, tt.args.opts...)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantCode, got.Code())
+			if tt.wantContentFormat != nil {
+				ct, errC := got.ContentFormat()
+				require.NoError(t, errC)
+				require.Equal(t, *tt.wantContentFormat, ct)
+				buf := bytes.NewBuffer(nil)
+				_, errR := buf.ReadFrom(got.Body())
+				require.NoError(t, errR)
+				require.Equal(t, tt.wantPayload, buf.Bytes())
+			}
+		})
+	}
+}
+
+func TestConnIPatch(t *testing.T) {
+	type args struct {
+		path          string
+		contentFormat message.MediaType
+		payload       io.ReadSeeker
+		opts          message.Options
+	}
+	tests := []struct {
+		name              string
+		args              args
+		wantCode          codes.Code
+		wantContentFormat *message.MediaType
+		wantPayload       interface{}
+		wantErr           bool
+	}{
+		{
+			name: "ok-a",
+			args: args{
+				path:          "/a",
+				contentFormat: message.TextPlain,
+				payload:       bytes.NewReader([]byte("ipatch-data")),
+			},
+			wantCode:          codes.Changed,
+			wantContentFormat: &message.TextPlain,
+			wantPayload:       []byte("ipatched"),
+		},
+		{
+			name: "notfound",
+			args: args{
+				path:          "/c",
+				contentFormat: message.TextPlain,
+				payload:       bytes.NewReader([]byte("data")),
+			},
+			wantCode: codes.NotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l, err := coapNet.NewListenUDP("udp", "")
+			require.NoError(t, err)
+			defer func() {
+				errC := l.Close()
+				require.NoError(t, errC)
+			}()
+			var wg sync.WaitGroup
+			defer wg.Wait()
+
+			m := mux.NewRouter()
+			err = m.Handle("/a", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+				assert.Equal(t, codes.IPATCH, r.Code())
+				ct, errH := r.Options().GetUint32(message.ContentFormat)
+				require.NoError(t, errH)
+				assert.Equal(t, message.TextPlain, message.MediaType(ct))
+				buf, errH := io.ReadAll(r.Body())
+				require.NoError(t, errH)
+				assert.Equal(t, []byte("ipatch-data"), buf)
+				errH = w.SetResponse(codes.Changed, message.TextPlain, bytes.NewReader([]byte("ipatched")))
+				require.NoError(t, errH)
+			}))
+			require.NoError(t, err)
+
+			s := NewServer(options.WithMux(m))
+			defer s.Stop()
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errS := s.Serve(l)
+				assert.NoError(t, errS)
+			}()
+
+			cc, err := Dial(l.LocalAddr().String())
+			require.NoError(t, err)
+			defer func() {
+				errC := cc.Close()
+				require.NoError(t, errC)
+				<-cc.Done()
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*3600)
+			defer cancel()
+			got, err := cc.IPatch(ctx, tt.args.path, tt.args.contentFormat, tt.args.payload, tt.args.opts...)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantCode, got.Code())
+			if tt.wantContentFormat != nil {
+				ct, errC := got.ContentFormat()
+				require.NoError(t, errC)
+				require.Equal(t, *tt.wantContentFormat, ct)
+				buf := bytes.NewBuffer(nil)
+				_, errR := buf.ReadFrom(got.Body())
+				require.NoError(t, errR)
+				require.Equal(t, tt.wantPayload, buf.Bytes())
+			}
+		})
+	}
+}
