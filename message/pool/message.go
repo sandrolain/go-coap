@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
@@ -200,6 +201,8 @@ func (r *Message) Options() message.Options {
 
 // SetPath stores the given path within URI-Path options.
 //
+// If p contains a '?' the query-string is parsed into one Uri-Query option
+// per '&'-separated parameter, as required by RFC 7252 §6.4.
 // The value is stored by the algorithm described in RFC7252 and
 // using the internal buffer. If the path is too long, but valid
 // (URI-Path segments must have maximal length of 255) the internal
@@ -207,20 +210,29 @@ func (r *Message) Options() message.Options {
 // If the path is too long, but not valid then the function returns
 // ErrInvalidValueLength error.
 func (r *Message) SetPath(p string) error {
-	opts, used, err := r.msg.Options.SetPath(r.valueBuffer, p)
+	// Split off any query string: RFC 7252 §6.4 defines separate Uri-Path and Uri-Query options.
+	path, query, hasQuery := strings.Cut(p, "?")
+	opts, used, err := r.msg.Options.SetPath(r.valueBuffer, path)
 	if errors.Is(err, message.ErrTooSmall) {
-		expandBy, errSize := message.GetPathBufferSize(p)
+		expandBy, errSize := message.GetPathBufferSize(path)
 		if errSize != nil {
 			return fmt.Errorf("cannot calculate buffer size for path: %w", errSize)
 		}
 		r.valueBuffer = append(r.valueBuffer, make([]byte, expandBy)...)
-		opts, used, err = r.msg.Options.SetPath(r.valueBuffer, p)
+		opts, used, err = r.msg.Options.SetPath(r.valueBuffer, path)
 	}
 	if err != nil {
 		return fmt.Errorf("cannot set path: %w", err)
 	}
 	r.msg.Options = opts
 	r.valueBuffer = r.valueBuffer[used:]
+	if hasQuery {
+		for _, param := range strings.Split(query, "&") {
+			if param != "" {
+				r.AddQuery(param)
+			}
+		}
+	}
 	r.isModified = true
 	return nil
 }

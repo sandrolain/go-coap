@@ -79,6 +79,13 @@ func NewRouter() *Router {
 			router.errors(fmt.Errorf("router handler: cannot set response: %w", err))
 		}
 	})
+	// RFC 7252 §7.1: servers SHOULD support GET /.well-known/core for resource discovery.
+	// Provide a default empty response; users can override by registering their own handler.
+	_ = router.Handle("/.well-known/core", HandlerFunc(func(w ResponseWriter, _ *Message) {
+		if err := w.SetResponse(codes.Content, message.AppLinkFormat, nil); err != nil {
+			router.errors(fmt.Errorf("router handler: cannot set response: %w", err))
+		}
+	}))
 	return router
 }
 
