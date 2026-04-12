@@ -914,6 +914,14 @@ func (cc *Conn) handleSpecialMessages(r *pool.Message) bool {
 		// the body of the message is need to be processed by the loopOverReceivedMessageQueue goroutine
 		return false
 	}
+	// RFC 7252 §4.2: RST messages not matched to an outstanding request MUST be silently ignored.
+	if r.Type() == message.Reset {
+		return true
+	}
+	// RFC 7252 §4.2: empty ACK messages (including malformed ones with body) MUST be silently ignored.
+	if r.Type() == message.Acknowledgement && r.Code() == codes.Empty {
+		return true
+	}
 	// separate message
 	if r.IsSeparateMessage() {
 		// msg was processed by token handler - just drop it.
