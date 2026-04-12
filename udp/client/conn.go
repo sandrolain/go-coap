@@ -779,6 +779,9 @@ func (cc *Conn) processResponse(reqType message.Type, reqMessageID int32, w *res
 	if reqType == message.Confirmable {
 		w.Message().SetType(message.Acknowledgement)
 		w.Message().SetMessageID(reqMessageID)
+	} else if reqType == message.NonConfirmable {
+		// RFC 7252 §5.2.3: responses to NON requests SHOULD also be NON.
+		w.Message().SetType(message.NonConfirmable)
 	}
 	if reqType == message.Confirmable || reqType == message.NonConfirmable {
 		err := cc.addResponseToCache(w.Message())
