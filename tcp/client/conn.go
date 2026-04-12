@@ -57,6 +57,11 @@ type Conn struct {
 	tcpSignalReceivedHandler        TCPSignalReceivedHandler
 	handlerMutex                    sync.RWMutex
 	peerBlockWiseTranferEnabled     atomic.Bool
+	// csmDoneOnce and csmDoneCh signal that the peer's CSM has been received.
+	// This is used by cc.do to avoid a race where peerBlockWiseTranferEnabled
+	// is checked before the peer's CSM arrives.
+	csmDoneOnce sync.Once
+	csmDoneCh   chan struct{}
 
 	receivedMessageReader *client.ReceivedMessageReader[*Conn]
 }
@@ -119,10 +124,17 @@ func NewConnWithOpts(connection *coapNet.Conn, cfg *Config, opts ...Option) *Con
 	for _, o := range opts {
 		o(&cfgOpts)
 	}
+	csmCh := make(chan struct{})
 	cc := Conn{
 		tokenHandlerContainer:           coapSync.NewMap[uint64, HandlerFunc](),
 		blockwiseSZX:                    cfg.BlockwiseSZX,
 		disablePeerTCPSignalMessageCSMs: cfg.DisablePeerTCPSignalMessageCSMs,
+		csmDoneCh:                       csmCh,
+	}
+	// If the peer's CSM messages are disabled (discarded), they will never
+	// arrive; close the channel immediately so cc.do doesn't block waiting.
+	if cfg.DisablePeerTCPSignalMessageCSMs {
+		close(csmCh)
 	}
 	limitParallelRequests := limitparallelrequests.New(cfg.LimitClientParallelRequests, cfg.LimitClientEndpointParallelRequests, cc.do, cc.doObserve)
 	cc.observationHandler = observation.NewHandler(&cc, cfg.Handler, limitParallelRequests.Do)
@@ -138,6 +150,9 @@ func NewConnWithOpts(connection *coapNet.Conn, cfg *Config, opts ...Option) *Con
 		cfgOpts.RequestMonitor,
 		cfg.ConnectionCacheSize,
 		cfg.MessagePool,
+		// Advertise BERT capability only when SZX=7 (BERT) is configured;
+		// regular SZX≤6 blockwise does not require TCPBlockWiseTransfer negotiation.
+		cc.blockWise != nil && cc.blockwiseSZX == blockwise.SZXBERT,
 	)
 	cc.session = session
 	if cc.processReceivedMessage == nil {
@@ -209,6 +224,22 @@ func (cc *Conn) doInternal(req *pool.Message) (*pool.Message, error) {
 //
 // Caller is responsible to release request and response.
 func (cc *Conn) do(req *pool.Message) (*pool.Message, error) {
+	if cc.blockWise != nil && !cc.peerBlockWiseTranferEnabled.Load() {
+		// Wait for the peer's CSM to be received before deciding whether to use
+		// blockwise. Without this, there is a race: the server may send Block2
+		// blocks after its CSM (setting peerBlockWiseTranferEnabled) arrives,
+		// but cc.do might have already bypassed blockWise.Do when the flag was
+		// still false — leaving the token absent from sendingMessagesCache and
+		// causing "cannot request body without paired request" errors.
+		select {
+		case <-cc.csmDoneCh:
+			// CSM received; peerBlockWiseTranferEnabled is now settled.
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-cc.session.Context().Done():
+			return nil, fmt.Errorf("connection was closed: %w", cc.Context().Err())
+		}
+	}
 	if !cc.peerBlockWiseTranferEnabled.Load() || cc.blockWise == nil {
 		return cc.doInternal(req)
 	}
@@ -432,6 +463,10 @@ func (cc *Conn) handleSignals(r *pool.Message) bool {
 		if r.HasOption(message.TCPBlockWiseTransfer) {
 			cc.peerBlockWiseTranferEnabled.Store(true)
 		}
+
+		// Signal that peer CSM has been received so cc.do can make
+		// the correct blockwise decision (see csmDoneCh).
+		cc.csmDoneOnce.Do(func() { close(cc.csmDoneCh) })
 
 		// signal CSM message is received.
 		cc.handleTCPSignalReceived(codes.CSM)

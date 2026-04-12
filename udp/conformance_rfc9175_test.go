@@ -5,8 +5,9 @@
 //
 // Test IDs: ET_001 – ET_006 (Echo & Request-Tag), HL_001 – HL_002 (HopLimit).
 // References:
-//   https://www.rfc-editor.org/rfc/rfc9175
-//   https://www.rfc-editor.org/rfc/rfc8768
+//
+//	https://www.rfc-editor.org/rfc/rfc9175
+//	https://www.rfc-editor.org/rfc/rfc8768
 package udp_test
 
 import (
@@ -299,8 +300,11 @@ func TestTC_CoAP_ET_006_RequestTag_Differentiation(t *testing.T) {
 	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], r *pool.Message) {
 		tag, errT := r.GetOptionBytes(optRequestTag)
 		if errT == nil {
+			// Clone the tag: the underlying buffer is reused by the message pool.
+			cloned := make([]byte, len(tag))
+			copy(cloned, tag)
 			mu.Lock()
-			receivedTags = append(receivedTags, tag)
+			receivedTags = append(receivedTags, cloned)
 			mu.Unlock()
 		}
 		_ = w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("ok")))
@@ -415,4 +419,160 @@ func TestTC_CoAP_HL_002_HopLimit_ValueOne_AtEndpoint(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, codes.Content, resp.Code(),
 		"RFC 8768 §3: HopLimit=1 at a non-proxy endpoint MUST NOT cause an error response")
+}
+
+// ── Additional RFC 9175 / RFC 8768 conformance tests (ET_007–ET_009) ──────
+
+// TC_CoAP_ET_007 – TP_CoAP_Echo_MaxSize_40Bytes
+//
+// Reference: RFC 9175 Section 2.2
+// "The Echo option is opaque and between 1 and 40 bytes in length."
+// A 40-byte Echo value is the maximum allowed size.
+//
+// Procedure: server sends Echo with exactly 40 bytes. Client echoes it.
+// Expected: 40-byte Echo option is transmitted and received correctly.
+func TestTC_CoAP_ET_007_Echo_MaxSize_40Bytes(t *testing.T) {
+	echoMax := make([]byte, 40)
+	for i := range echoMax {
+		echoMax[i] = byte(i + 1)
+	}
+
+	var receivedEcho []byte
+	var mu sync.Mutex
+
+	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], r *pool.Message) {
+		echo, errE := r.GetOptionBytes(optEcho)
+		if errE == nil && bytes.Equal(echo, echoMax) {
+			// Correct 40-byte Echo echoed back.
+			_ = w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("fresh")))
+			mu.Lock()
+			receivedEcho = echo
+			mu.Unlock()
+			return
+		}
+		// Challenge with 40-byte Echo.
+		_ = w.SetResponse(codes.Unauthorized, message.TextPlain, nil,
+			message.Option{ID: optEcho, Value: echoMax})
+	})
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	// Step 1: get challenge.
+	resp1, err := cc.Get(ctx, "/protected")
+	require.NoError(t, err)
+	require.Equal(t, codes.Unauthorized, resp1.Code())
+
+	echoVal, err := resp1.GetOptionBytes(optEcho)
+	require.NoError(t, err)
+	require.Len(t, echoVal, 40,
+		"RFC 9175 §2.2: Echo option size MUST be between 1 and 40 bytes")
+
+	// Step 2: echo back.
+	req, err := cc.NewGetRequest(ctx, "/protected")
+	require.NoError(t, err)
+	req.SetOptionBytes(optEcho, echoVal)
+
+	resp2, err := cc.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, codes.Content, resp2.Code(),
+		"RFC 9175 §2.2: 40-byte Echo must be accepted when echoed correctly")
+
+	mu.Lock()
+	require.Equal(t, echoMax, receivedEcho,
+		"RFC 9175 §2.2: 40-byte Echo value must be preserved intact")
+	mu.Unlock()
+}
+
+// TC_CoAP_ET_008 – TP_CoAP_RequestTag_MaxSize_8Bytes
+//
+// Reference: RFC 9175 Section 3.2
+// "The Request-Tag is an opaque byte string between 0 and 8 bytes."
+// An 8-byte Request-Tag is the maximum allowed size.
+//
+// Procedure: client sends GET with 8-byte Request-Tag.
+// Expected: server receives the full 8-byte Request-Tag.
+func TestTC_CoAP_ET_008_RequestTag_MaxSize_8Bytes(t *testing.T) {
+	maxTag := []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
+	var receivedTag []byte
+	var mu sync.Mutex
+
+	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], r *pool.Message) {
+		tag, errT := r.GetOptionBytes(optRequestTag)
+		if errT == nil {
+			mu.Lock()
+			receivedTag = tag
+			mu.Unlock()
+		}
+		_ = w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("ok")))
+	})
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	req, err := cc.NewGetRequest(ctx, "/resource")
+	require.NoError(t, err)
+	req.SetOptionBytes(optRequestTag, maxTag)
+
+	resp, err := cc.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, codes.Content, resp.Code())
+
+	mu.Lock()
+	require.Equal(t, maxTag, receivedTag,
+		"RFC 9175 §3.2: 8-byte Request-Tag (maximum) must be received intact")
+	mu.Unlock()
+}
+
+// TC_CoAP_ET_009 – TP_CoAP_RequestTag_Empty
+//
+// Reference: RFC 9175 Section 3.2
+// "A zero-length Request-Tag is valid and means that no tag is associated."
+//
+// Procedure: client sends GET with 0-byte Request-Tag.
+// Expected: server receives the empty Request-Tag option.
+func TestTC_CoAP_ET_009_RequestTag_Empty(t *testing.T) {
+	gotEmptyTag := false
+	var mu sync.Mutex
+
+	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], r *pool.Message) {
+		tag, errT := r.GetOptionBytes(optRequestTag)
+		if errT == nil && len(tag) == 0 {
+			mu.Lock()
+			gotEmptyTag = true
+			mu.Unlock()
+		}
+		_ = w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("ok")))
+	})
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	req, err := cc.NewGetRequest(ctx, "/resource")
+	require.NoError(t, err)
+	req.SetOptionBytes(optRequestTag, []byte{}) // 0-byte empty tag
+
+	resp, err := cc.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, codes.Content, resp.Code())
+
+	mu.Lock()
+	require.True(t, gotEmptyTag,
+		"RFC 9175 §3.2: 0-byte Request-Tag must be received by server")
+	mu.Unlock()
 }

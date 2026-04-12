@@ -961,3 +961,167 @@ func TestTC_CoAP_BW_018_Observe_LargeNotification(t *testing.T) {
 			"(possible regression of Bug #575 — blockwise+observe combination)")
 	}
 }
+
+// ── Additional RFC 7959 conformance tests (BW_019–BW_022) ─────────────────
+
+// TC_CoAP_BW_019 – TP_CoAP_BlockWise_Block2_SZX_Downgrade
+//
+// Reference: RFC 7959 Section 2.2
+// "The block size (SZX) used in a transfer is always determined by the
+// smaller of the capabilities. The server may return a smaller SZX than
+// the client requested."
+//
+// Procedure: client requests SZX=6 (1024B), server configured with SZX=0 (16B).
+// Expected: transfer completes with 16-byte blocks (server's smaller SZX).
+func TestTC_CoAP_BW_019_Block2_SZX_Downgrade(t *testing.T) {
+	payload := bytes.Repeat([]byte("D"), 128) // 128 bytes
+
+	m := mux.NewRouter()
+	err := m.Handle("/downgrade", mux.HandlerFunc(func(w mux.ResponseWriter, _ *mux.Message) {
+		errS := w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader(payload))
+		require.NoError(t, errS)
+	}))
+	require.NoError(t, err)
+
+	// Server: SZX=0 (16-byte blocks)
+	_, addr, cleanup := startBlockwiseServer(t, m, blockwise.SZX16)
+	defer cleanup()
+
+	// Client: SZX=6 (1024-byte blocks) — larger than server
+	cc := startBlockwiseClient(t, addr, blockwise.SZX1024)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := cc.Get(ctx, "/downgrade")
+	require.NoError(t, err)
+	require.Equal(t, codes.Content, resp.Code())
+
+	body, err := resp.ReadBody()
+	require.NoError(t, err)
+	require.Equal(t, payload, body,
+		"RFC 7959 §2.2: block size negotiation must succeed — server uses smaller SZX")
+}
+
+// TC_CoAP_BW_020 – TP_CoAP_BlockWise_Block1_Then_Block2
+//
+// Reference: RFC 7959 Section 2.3, 2.1
+// A POST with a large body (Block1) that produces a large response (Block2)
+// exercises both directions of blockwise transfer in one exchange.
+//
+// Procedure: POST /transform with 512B body; handler returns 512B response.
+// Expected: both request and response are reassembled correctly.
+func TestTC_CoAP_BW_020_Block1_POST_Then_Block2_Response(t *testing.T) {
+	requestPayload := bytes.Repeat([]byte("REQ"), 171)[:512]  // 512 bytes
+	responsePayload := bytes.Repeat([]byte("RSP"), 171)[:512] // 512 bytes
+
+	var receivedRequest []byte
+	m := mux.NewRouter()
+	err := m.Handle("/transform", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+		body, errR := r.ReadBody()
+		require.NoError(t, errR)
+		receivedRequest = body
+		errS := w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader(responsePayload))
+		require.NoError(t, errS)
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startBlockwiseServer(t, m, blockwise.SZX64)
+	defer cleanup()
+
+	cc := startBlockwiseClient(t, addr, blockwise.SZX64)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := cc.Post(ctx, "/transform", message.TextPlain, bytes.NewReader(requestPayload))
+	require.NoError(t, err)
+	require.Equal(t, codes.Content, resp.Code())
+
+	require.Equal(t, requestPayload, receivedRequest,
+		"RFC 7959 §2.3: server must reassemble complete Block1 request body")
+
+	body, err := resp.ReadBody()
+	require.NoError(t, err)
+	require.Equal(t, responsePayload, body,
+		"RFC 7959 §2.1: client must reassemble complete Block2 response body")
+}
+
+// TC_CoAP_BW_021 – TP_CoAP_BlockWise_Block2_SZX1024_LargeGET
+//
+// Reference: RFC 7959 Section 2.2
+// SZX=6 (1024 bytes) is the maximum block size for UDP.
+//
+// Procedure: GET /large-1024 with 4096-byte payload; SZX=6 (1024B blocks).
+// Expected: payload reassembled correctly in ~4 blocks.
+func TestTC_CoAP_BW_021_Block2_SZX1024_LargeGET(t *testing.T) {
+	payload := bytes.Repeat([]byte("K"), 4096)
+
+	m := mux.NewRouter()
+	err := m.Handle("/large-1024", mux.HandlerFunc(func(w mux.ResponseWriter, _ *mux.Message) {
+		errS := w.SetResponse(codes.Content, message.AppOctets, bytes.NewReader(payload))
+		require.NoError(t, errS)
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startBlockwiseServer(t, m, blockwise.SZX1024)
+	defer cleanup()
+
+	cc := startBlockwiseClient(t, addr, blockwise.SZX1024)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := cc.Get(ctx, "/large-1024")
+	require.NoError(t, err)
+	require.Equal(t, codes.Content, resp.Code())
+
+	body, err := resp.ReadBody()
+	require.NoError(t, err)
+	require.Equal(t, payload, body,
+		"RFC 7959 §2.2: SZX=6 (1024B) must reassemble 4096-byte response")
+}
+
+// TC_CoAP_BW_022 – TP_CoAP_BlockWise_Block1_PUT_BinaryPayload
+//
+// Reference: RFC 7959 Section 2.5
+// "Block-wise transfers MUST maintain semantic equivalence with non-blockwise
+// transfers — the assembled payload is byte-for-byte identical."
+//
+// Procedure: PUT /binary with binary payload (non-text, all byte values 0x00-0xFF).
+// Expected: server receives byte-for-byte identical payload.
+func TestTC_CoAP_BW_022_Block1_PUT_BinaryIntegrity(t *testing.T) {
+	payload := make([]byte, 512)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+
+	var receivedPayload []byte
+	m := mux.NewRouter()
+	err := m.Handle("/binary", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+		body, errR := r.ReadBody()
+		require.NoError(t, errR)
+		receivedPayload = body
+		errS := w.SetResponse(codes.Changed, message.AppOctets, nil)
+		require.NoError(t, errS)
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startBlockwiseServer(t, m, blockwise.SZX64)
+	defer cleanup()
+
+	cc := startBlockwiseClient(t, addr, blockwise.SZX64)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := cc.Put(ctx, "/binary", message.AppOctets, bytes.NewReader(payload))
+	require.NoError(t, err)
+	require.Equal(t, codes.Changed, resp.Code())
+	require.Equal(t, payload, receivedPayload,
+		"RFC 7959 §2.5: Block1 binary payload must be byte-for-byte identical after reassembly")
+}
