@@ -352,7 +352,19 @@ func isActiveMulticastInterface(iface net.Interface) bool {
 	}
 	if iface.Flags&net.FlagUp == net.FlagUp && iface.Flags&net.FlagMulticast == net.FlagMulticast && iface.Flags&net.FlagLoopback != net.FlagLoopback {
 		addrs, err := iface.Addrs()
-		return err == nil && len(addrs) > 0
+		if err != nil {
+			return false
+		}
+		// Require at least one private IP (link-local only is not sufficient)
+		for _, addr := range addrs {
+			ip, _, err := net.ParseCIDR(addr.String())
+			if err != nil {
+				continue
+			}
+			if ip.IsPrivate() {
+				return true
+			}
+		}
 	}
 	return false
 }
