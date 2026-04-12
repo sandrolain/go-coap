@@ -1,0 +1,33 @@
+# go-coap SUT image.
+#
+# Builds the CoAP SUT server from iottestware/sut/main.go using the
+# same go module as the go-coap workspace.
+#
+# Build context: go-coap workspace root
+#
+#   docker build -t go-coap-sut -f iottestware/Dockerfile.sut .
+
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /build
+
+# Copy module files first for layer caching.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the whole source tree (needed for transitive imports inside the module).
+COPY . .
+
+# Build the SUT binary statically.
+RUN CGO_ENABLED=0 GOOS=linux go build \
+        -o /sut \
+        ./conformance/iottestware/sut/main.go
+
+# ── runtime image ─────────────────────────────────────────────────────────────
+FROM scratch
+
+COPY --from=builder /sut /sut
+
+EXPOSE 5683/udp
+
+ENTRYPOINT ["/sut"]

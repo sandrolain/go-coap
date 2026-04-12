@@ -1,0 +1,139 @@
+# IoT-Testware CoAP conformance test image.
+#
+# Clones all Titan / iottestware.coap dependencies EXPLICITLY to avoid two
+# bugs in the upstream install.py that prevent building inside Docker:
+#
+#  1. git opens /dev/tty to prompt for credentials even for public repos
+#     ("fatal: could not read Username: No such device or address")
+#     → fixed by ENV GIT_TERMINAL_PROMPT=0 + credential.helper ''
+#
+#  2. install.py calls subprocess.Popen([...git clone...]) WITHOUT
+#     .communicate() for the iottestware.coap repository (fire-and-forget),
+#     so the clone may not have finished when the build phase starts.
+#     → fixed by pre-cloning every repo ourselves before building.
+#
+# Build:
+#   docker build -t iottestware-coap -f Dockerfile.testware .
+
+FROM ubuntu:20.04
+
+LABEL description="IoT-Testware CoAP conformance test suite (Titan 11.1.0)"
+
+# ── prevent git from opening /dev/tty ────────────────────────────────────────
+ENV GIT_TERMINAL_PROMPT=0
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── system deps: Titan build tools + iottestware runtime ─────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git gdb curl expect g++ make libssl-dev \
+        libxml2-dev libncurses5-dev flex bison \
+        libsctp-dev xutils-dev xsltproc automake perl \
+        libedit2 libedit-dev \
+        netcat-openbsd python3 vim \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && git config --global credential.helper '' \
+    && git config --global core.askPass '/bin/echo'
+
+# ── Create titan user ─────────────────────────────────────────────────────────
+RUN useradd --create-home --shell /bin/bash titan
+
+# ── Download and build Titan 11.1.0 from source tarball ──────────────────────
+WORKDIR /home/titan
+RUN curl -fsSL \
+    https://gitlab.eclipse.org/eclipse/titan/titan.core/-/archive/11.1.0/titan.core-11.1.0.tar.gz \
+    | tar -xz \
+ && mv titan.core-11.1.0 titan.core \
+ && chown -R titan:titan /home/titan/titan.core
+
+WORKDIR /home/titan/titan.core
+RUN printf 'TTCN3_DIR := /home/titan/titan.core/Install\nXMLDIR := /usr\nOPENSSL_DIR := /usr\nJNI := no\nGEN_PDF := no\n' \
+    > Makefile.personal
+
+USER titan
+RUN make install
+USER root
+
+# ── Titan env ─────────────────────────────────────────────────────────────────
+ENV TTCN3_DIR=/home/titan/titan.core/Install
+ENV PATH=/home/titan/titan.core/Install/bin:$PATH
+ENV LD_LIBRARY_PATH=/home/titan/titan.core/Install/lib
+
+WORKDIR /home/titan
+
+# ── path layout (must match install.py so the .tpd relative paths resolve) ───
+# DEPS               = /home/titan/iottestware
+# DEPS/IoT-Testware/iottestware.coap   ← test suite sources
+# DEPS/ProtocolModules/CoAP            ← CoAP protocol module
+# DEPS/TestPorts/IPL4asp               ← IPL4asp test port
+# DEPS/TestPorts/Common_Components/Socket_API_CNL113686
+# DEPS/ProtocolModules/COMMON
+# DEPS/Libraries/TCCUsefulFunctions_CNL113472
+
+ARG DEPS=/home/titan/iottestware
+ARG COAP_SRC=${DEPS}/IoT-Testware/iottestware.coap
+
+RUN mkdir -p \
+    "${DEPS}/TestPorts/Common_Components" \
+    "${DEPS}/ProtocolModules" \
+    "${DEPS}/Libraries" \
+    "${DEPS}/IoT-Testware"
+
+# ── iottestware.coap test suite (GitHub – still active) ──────────────────────
+RUN git clone --quiet \
+    https://github.com/eclipse-iottestware/iottestware.coap.git \
+    "${COAP_SRC}"
+
+# ── Titan test port: Socket-API (GitLab) ─────────────────────────────────────
+RUN git clone --quiet \
+    https://gitlab.eclipse.org/eclipse/titan/titan.TestPorts.Common_Components.Socket-API.git \
+    "${DEPS}/TestPorts/Common_Components/Socket_API_CNL113686"
+
+# ── Titan test port: IPL4asp (GitLab) ────────────────────────────────────────
+RUN git clone --quiet \
+    https://gitlab.eclipse.org/eclipse/titan/titan.TestPorts.IPL4asp.git \
+    "${DEPS}/TestPorts/IPL4asp"
+
+# ── Titan protocol module: COMMON (GitLab) ───────────────────────────────────
+RUN git clone --quiet \
+    https://gitlab.eclipse.org/eclipse/titan/titan.ProtocolModules.COMMON.git \
+    "${DEPS}/ProtocolModules/COMMON"
+
+# ── Titan protocol module: CoAP (GitLab) ─────────────────────────────────────
+RUN git clone --quiet \
+    https://gitlab.eclipse.org/eclipse/titan/titan.ProtocolModules.CoAP.git \
+    "${DEPS}/ProtocolModules/CoAP"
+
+# ── Titan library: TCCUsefulFunctions (GitLab) ────────────────────────────────
+RUN git clone --quiet \
+    https://gitlab.eclipse.org/eclipse/titan/titan.Libraries.TCCUsefulFunctions.git \
+    "${DEPS}/Libraries/TCCUsefulFunctions_CNL113472"
+
+# ── Build the CoAP test suite binary ─────────────────────────────────────────
+# The TPD specifies workingDirectory=bin; ttcn3_makefilegen with -t generates
+# Makefile at <tpd_dir>/bin/Makefile.  All referenced .tpd paths in the TPD
+# are relative to the TPD file itself, so we cd there first.
+RUN cd "${COAP_SRC}" \
+  && mkdir -p bin \
+  && ttcn3_makefilegen -f -g -m \
+       -t iottestware.coap.tpd \
+       -e iottestware.coap \
+  && cd bin \
+  && make compile \
+  && make
+
+# ── set up the playground ────────────────────────────────────────────────────
+RUN mkdir -p /home/titan/playground/coap \
+  && mv "${COAP_SRC}/bin/iottestware.coap" /home/titan/playground/coap/ \
+  && cp  "${COAP_SRC}/cfg/"*              /home/titan/playground/coap/
+
+WORKDIR /home/titan/playground/coap
+
+# ── configuration + entrypoint ───────────────────────────────────────────────
+COPY CoAP_SUT.cfg   /home/titan/playground/coap/CoAP_SUT.cfg
+COPY entrypoint.sh  /entrypoint.sh
+COPY parse_log.py   /home/titan/parse_log.py
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,41 @@
+# IoT-Testware CoAP conformance tests against go-coap SUT
+#
+# Usage:
+#   cd <workspace-root>/iottestware
+#   docker compose up --build --abort-on-container-exit
+#
+# Results / Titan logs are written to ./results/ on the host.
+
+services:
+  # ── System Under Test: go-coap server ────────────────────────────────────
+  sut:
+    image: go-coap-sut
+    build:
+      context: ..
+      dockerfile: iottestware/Dockerfile.sut
+    networks:
+      - coap-net
+    ports:
+      - "5683:5683/udp"
+    # The scratch image has no shell; SUT readiness is checked by the
+    # testware entrypoint via nc -zu before launching ttcn3_start.
+
+  # ── IoT-Testware CoAP test runner ─────────────────────────────────────────
+  testware:
+    image: iottestware-coap
+    build:
+      context: .
+      dockerfile: Dockerfile.testware
+    depends_on:
+      - sut
+    environment:
+      - SUT_HOST=sut
+      - SUT_PORT=5683
+    volumes:
+      - ./results:/home/titan/logs
+    networks:
+      - coap-net
+
+networks:
+  coap-net:
+    driver: bridge
