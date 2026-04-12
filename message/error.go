@@ -14,4 +14,5 @@ var (
 	ErrInvalidEncoding              = errors.New("invalid encoding")
 	ErrOptionNotFound               = errors.New("option not found")
 	ErrOptionDuplicate              = errors.New("duplicated option")
+	ErrInvalidUTF8                  = errors.New("invalid UTF-8 string")
 )

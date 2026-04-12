@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/plgd-dev/go-coap/v3/pkg/math"
 )
@@ -103,6 +104,9 @@ func (options Options) path(buf []byte, id OptionID) (int, error) {
 	}
 	var needed int
 	for i := firstIdx; i < lastIdx; i++ {
+		if !utf8.Valid(options[i].Value) {
+			return -1, fmt.Errorf("option at index %d: %w", i, ErrInvalidUTF8)
+		}
 		needed += len(options[i].Value)
 		needed++
 	}
