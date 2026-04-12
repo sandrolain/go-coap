@@ -347,7 +347,11 @@ func TestTC_CoAP_OB_005_MultipleNotifications(t *testing.T) {
 // Procedure: register for /temp-sensor; server sends notification with Max-Age.
 // Expected: notification carries Max-Age option.
 func TestTC_CoAP_OB_006_MaxAgeInNotification(t *testing.T) {
-	notifReceived := make(chan *pool.Message, 1)
+	type notifResult struct {
+		maxAge uint32
+		err    error
+	}
+	notifReceived := make(chan notifResult, 1)
 
 	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], r *pool.Message) {
 		obs, errO := r.Observe()
@@ -383,8 +387,10 @@ func TestTC_CoAP_OB_006_MaxAgeInNotification(t *testing.T) {
 	defer cancel()
 
 	obs, err := cc.Observe(ctx, "/temp-sensor", func(msg *pool.Message) {
+		// Read MaxAge inside the callback: pool.Message is only valid for the lifetime of the callback.
+		v, errMA := msg.Options().GetUint32(message.MaxAge)
 		select {
-		case notifReceived <- msg:
+		case notifReceived <- notifResult{maxAge: v, err: errMA}:
 		default:
 		}
 	})
@@ -396,11 +402,10 @@ func TestTC_CoAP_OB_006_MaxAgeInNotification(t *testing.T) {
 	}()
 
 	select {
-	case msg := <-notifReceived:
-		maxAge, errMA := msg.Options().GetUint32(message.MaxAge)
-		require.NoError(t, errMA,
-			"RFC 7641 §4.6: notification SHOULD include Max-Age option; got error: %v", errMA)
-		require.Greater(t, maxAge, uint32(0),
+	case res := <-notifReceived:
+		require.NoError(t, res.err,
+			"RFC 7641 §4.6: notification SHOULD include Max-Age option; got error: %v", res.err)
+		require.Greater(t, res.maxAge, uint32(0),
 			"RFC 7641 §4.6: Max-Age value must be positive")
 	case <-time.After(3 * time.Second):
 		require.FailNow(t, "RFC 7641: timed out waiting for notification with Max-Age")
