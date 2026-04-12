@@ -812,7 +812,22 @@ func (cc *Conn) handleReq(w *responsewriter.ResponseWriter[*Conn], req *pool.Mes
 	w.Message().SetModified(false)
 	reqType := req.Type()
 	reqMessageID := req.MessageID()
-	cc.handle(w, req)
+	// RFC 7252 §5.4.1: if the message is a request and contains an unrecognized critical
+	// (odd-numbered) option, the server MUST return 4.02 Bad Option.
+	if reqCode := req.Code(); reqCode >= codes.GET && uint8(reqCode) <= 0x07 {
+		for _, opt := range req.Options() {
+			if uint32(opt.ID)%2 == 1 {
+				if _, known := message.CoapOptionDefs[opt.ID]; !known {
+					w.Message().SetCode(codes.BadOption)
+					w.Message().SetModified(true)
+					break
+				}
+			}
+		}
+	}
+	if !w.Message().IsModified() {
+		cc.handle(w, req)
+	}
 
 	err := cc.processResponse(reqType, reqMessageID, w)
 	if err != nil {
