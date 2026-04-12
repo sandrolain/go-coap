@@ -123,11 +123,15 @@ func (c *Coder) Decode(data []byte, m *message.Message) (int, error) {
 	data = data[tokenLen:]
 
 	optionDefs := message.CoapOptionDefs
-	proc, err := m.Options.Unmarshal(data, optionDefs)
+	proc, hasMarker, err := m.Options.UnmarshalWithPayloadMarker(data, optionDefs)
 	if err != nil {
 		return -1, err
 	}
 	data = data[proc:]
+	if hasMarker && len(data) == 0 {
+		// RFC 7252 §3: a payload marker MUST be followed by at least one byte.
+		return -1, ErrLonePayloadMarker
+	}
 	if len(data) == 0 {
 		data = nil
 	}

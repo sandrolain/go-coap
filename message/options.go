@@ -547,11 +547,22 @@ func (options Options) Marshal(buf []byte) (int, error) {
 
 // Unmarshal unmarshals data bytes to options and returns the number of consumed bytes.
 func (options *Options) Unmarshal(data []byte, optionDefs map[OptionID]OptionDef) (int, error) {
+	proc, _, err := options.UnmarshalWithPayloadMarker(data, optionDefs)
+	return proc, err
+}
+
+// UnmarshalWithPayloadMarker is like Unmarshal but also reports whether the
+// 0xFF payload marker was encountered while parsing the option list.
+// This lets callers detect a "lone payload marker" (0xFF with no payload following)
+// which is a format error per RFC 7252 §3.
+func (options *Options) UnmarshalWithPayloadMarker(data []byte, optionDefs map[OptionID]OptionDef) (int, bool, error) {
 	prev := 0
 	processed := 0
+	hasMarker := false
 	for len(data) > 0 {
 		if data[0] == 0xff {
 			processed++
+			hasMarker = true
 			break
 		}
 
@@ -559,7 +570,7 @@ func (options *Options) Unmarshal(data []byte, optionDefs map[OptionID]OptionDef
 		length := int(data[0] & 0x0f)
 
 		if delta == ExtendOptionError || length == ExtendOptionError {
-			return -1, ErrOptionUnexpectedExtendMarker
+			return -1, false, ErrOptionUnexpectedExtendMarker
 		}
 
 		data = data[1:]
@@ -567,33 +578,33 @@ func (options *Options) Unmarshal(data []byte, optionDefs map[OptionID]OptionDef
 
 		proc, delta, err := parseExtOpt(data, delta)
 		if err != nil {
-			return -1, err
+			return -1, false, err
 		}
 		processed += proc
 		data = data[proc:]
 		proc, length, err = parseExtOpt(data, length)
 		if err != nil {
-			return -1, err
+			return -1, false, err
 		}
 		processed += proc
 		data = data[proc:]
 
 		if len(data) < length {
-			return -1, ErrOptionTruncated
+			return -1, false, ErrOptionTruncated
 		}
 
 		option := Option{}
 		oid, err := math.SafeCastTo[OptionID](prev + delta)
 		if err != nil {
-			return -1, fmt.Errorf("%w: %w", ErrOptionNotFound, err)
+			return -1, false, fmt.Errorf("%w: %w", ErrOptionNotFound, err)
 		}
 		proc, err = option.Unmarshal(data[:length], optionDefs, oid)
 		if err != nil {
-			return -1, err
+			return -1, false, err
 		}
 
 		if cap(*options) == len(*options) {
-			return -1, ErrOptionsTooSmall
+			return -1, false, ErrOptionsTooSmall
 		}
 		if option.ID != 0 {
 			(*options) = append(*options, option)
@@ -604,7 +615,7 @@ func (options *Options) Unmarshal(data []byte, optionDefs map[OptionID]OptionDef
 		prev = int(oid)
 	}
 
-	return processed, nil
+	return processed, hasMarker, nil
 }
 
 // ResetOptionsTo resets options to in options.

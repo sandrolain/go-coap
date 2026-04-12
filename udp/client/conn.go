@@ -930,6 +930,10 @@ func (cc *Conn) Process(cm *coapNet.ControlMessage, datagram []byte) error {
 	_, err := req.UnmarshalWithDecoder(coder.DefaultCoder, datagram)
 	if err != nil {
 		cc.ReleaseMessage(req)
+		if errors.Is(err, coder.ErrLonePayloadMarker) {
+			// RFC 7252 §4.1: silently discard malformed datagrams; do not close connection.
+			return nil
+		}
 		return err
 	}
 	req.SetControlMessage(cm)
