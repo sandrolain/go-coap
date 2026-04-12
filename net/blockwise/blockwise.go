@@ -805,6 +805,15 @@ func (b *BlockWise[C]) processReceivedMessage(w *responsewriter.ResponseWriter[C
 		return fmt.Errorf("cannot get payload: %w", err)
 	}
 	off := num * szx.Size()
+	if off > payloadSize {
+		// RFC 7959 §2.9 (B1-5): gap in block sequence detected → return 4.08 Request Entity Incomplete.
+		b.receivingMessagesCache.Delete(tokenStr)
+		sendMessage := b.cc.AcquireMessage(r.Context())
+		sendMessage.SetToken(token)
+		sendMessage.SetCode(codes.RequestEntityIncomplete)
+		w.SetMessage(sendMessage)
+		return nil
+	}
 	if off == payloadSize { //nolint:nestif
 		payloadSize, err = copyToPayloadFromOffset(r, payloadFile, off)
 		if err != nil {
