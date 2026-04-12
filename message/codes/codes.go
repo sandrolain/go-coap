@@ -17,6 +17,9 @@ const (
 	POST   Code = 2
 	PUT    Code = 3
 	DELETE Code = 4
+	FETCH  Code = 5
+	PATCH  Code = 6
+	IPATCH Code = 7
 )
 
 // Response Codes
@@ -66,6 +69,9 @@ var strToCode = map[string]Code{
 	`"POST"`:                               POST,
 	`"PUT"`:                                PUT,
 	`"DELETE"`:                             DELETE,
+	`"FETCH"`:                              FETCH,
+	`"PATCH"`:                              PATCH,
+	`"iPATCH"`:                             IPATCH,
 	`"Created"`:                            Created,
 	`"Deleted"`:                            Deleted,
 	`"Valid"`:                              Valid,

@@ -98,3 +98,37 @@ func FuzzUnmarshalJSON(f *testing.F) {
 		_ = got.UnmarshalJSON(input_data)
 	})
 }
+
+func TestRFC8132Codes(t *testing.T) {
+	// Verify FETCH, PATCH, iPATCH code values per RFC 8132
+	require.Equal(t, Code(5), FETCH)
+	require.Equal(t, Code(6), PATCH)
+	require.Equal(t, Code(7), IPATCH)
+
+	// Verify String() works
+	require.Equal(t, "FETCH", FETCH.String())
+	require.Equal(t, "PATCH", PATCH.String())
+	require.Equal(t, "iPATCH", IPATCH.String())
+
+	// Verify ToCode() works
+	for _, tc := range []struct {
+		str  string
+		code Code
+	}{
+		{"FETCH", FETCH},
+		{"PATCH", PATCH},
+		{"iPATCH", IPATCH},
+	} {
+		c, err := ToCode(tc.str)
+		require.NoError(t, err)
+		require.Equal(t, tc.code, c)
+	}
+
+	// Verify JSON marshal/unmarshal
+	var got []Code
+	want := []Code{FETCH, PATCH, IPATCH}
+	in := `["FETCH", "PATCH", "iPATCH"]`
+	err := json.Unmarshal([]byte(in), &got)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+}
