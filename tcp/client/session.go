@@ -40,6 +40,7 @@ type Session struct {
 	connectionCacheSize        uint16
 	disableTCPSignalMessageCSM bool
 	closeSocket                bool
+	bertEnabled                bool
 }
 
 func NewSession(
@@ -53,6 +54,7 @@ func NewSession(
 	requestMonitor RequestMonitorFunc,
 	connectionCacheSize uint16,
 	messagePool *pool.Pool,
+	bertEnabled bool,
 ) *Session {
 	ctx, cancel := context.WithCancel(ctx)
 	if errors == nil {
@@ -81,6 +83,7 @@ func NewSession(
 		done:                       make(chan struct{}),
 		connectionCacheSize:        connectionCacheSize,
 		messagePool:                messagePool,
+		bertEnabled:                bertEnabled,
 	}
 	s.ctx.Store(&ctx)
 
@@ -220,6 +223,14 @@ func (s *Session) sendCSM() error {
 	defer s.messagePool.ReleaseMessage(req)
 	req.SetCode(codes.CSM)
 	req.SetToken(token)
+	// RFC 8323 §5.3: advertise Max-Message-Size always.
+	// TCPBlockWiseTransfer is advertised only for BERT (SZX=7) connections;
+	// regular SZX ≤ 6 blockwise transfers fit within MaxMessageSize and
+	// do not require explicit negotiation.
+	req.SetOptionUint32(message.TCPMaxMessageSize, s.maxMessageSize)
+	if s.bertEnabled {
+		req.SetOptionBytes(message.TCPBlockWiseTransfer, []byte{})
+	}
 	return s.WriteMessage(req)
 }
 

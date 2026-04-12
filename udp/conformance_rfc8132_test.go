@@ -515,3 +515,183 @@ func TestTC_CoAP_FP_010_FETCH_Accept(t *testing.T) {
 	require.Equal(t, jsonCF, cf,
 		"RFC 8132 §2.4: server MUST honor the Accept option and return requested Content-Format")
 }
+
+// ── Additional RFC 8132 conformance tests (FP_011–FP_013) ─────────────────
+
+// TC_CoAP_FP_011 – TP_CoAP_iPATCH_Idempotent
+//
+// Reference: RFC 8132 Section 4
+// "iPATCH is an idempotent variant of PATCH. Applying the same iPATCH
+// operation multiple times MUST produce the same result and MUST NOT
+// cause additional side effects."
+//
+// Procedure: send the same iPATCH twice. Verify same result each time.
+func TestTC_CoAP_FP_011_iPATCH_Idempotent(t *testing.T) {
+	var mu sync.Mutex
+	state := "original"
+	callCount := 0
+
+	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], r *pool.Message) {
+		if r.Code() != codeIPATCH {
+			_ = w.SetResponse(codes.MethodNotAllowed, message.TextPlain, nil)
+			return
+		}
+		body, errB := r.ReadBody()
+		if errB != nil {
+			_ = w.SetResponse(codes.BadRequest, message.TextPlain, nil)
+			return
+		}
+		mu.Lock()
+		state = string(body)
+		callCount++
+		mu.Unlock()
+		_ = w.SetResponse(codes.Changed, message.TextPlain, nil)
+	})
+	defer cleanup()
+
+	sendIPatch := func() codes.Code {
+		cc, errD := udp.Dial(addr)
+		require.NoError(t, errD)
+		defer func() { _ = cc.Close(); <-cc.Done() }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+		defer cancel()
+
+		req, errR := cc.NewGetRequest(ctx, "/resource")
+		require.NoError(t, errR)
+		req.SetCode(codeIPATCH)
+		req.SetContentFormat(message.TextPlain)
+		req.SetBody(bytes.NewReader([]byte("idempotent-value")))
+
+		resp, errDo := cc.Do(req)
+		require.NoError(t, errDo)
+		return resp.Code()
+	}
+
+	code1 := sendIPatch()
+	code2 := sendIPatch()
+
+	require.Equal(t, codes.Changed, code1)
+	require.Equal(t, code1, code2,
+		"RFC 8132 §4: iPATCH is idempotent — repeated requests MUST return same code")
+
+	mu.Lock()
+	require.Equal(t, "idempotent-value", state,
+		"RFC 8132 §4: iPATCH MUST produce the same final state regardless of repetitions")
+	mu.Unlock()
+}
+
+// TC_CoAP_FP_012 – TP_CoAP_FETCH_ServerUsesBody
+//
+// Reference: RFC 8132 Section 2
+// "The FETCH method is used to obtain a representation of a resource,
+// where the representation is described by the request payload."
+// The server uses the request body to determine WHICH data to return.
+//
+// Procedure: FETCH /multi with body "field=temperature" → server returns temp.
+//
+//	FETCH /multi with body "field=humidity" → server returns humidity.
+func TestTC_CoAP_FP_012_FETCH_ServerUsesBody(t *testing.T) {
+	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], r *pool.Message) {
+		if r.Code() != codeFETCH {
+			_ = w.SetResponse(codes.MethodNotAllowed, message.TextPlain, nil)
+			return
+		}
+		body, errB := r.ReadBody()
+		if errB != nil {
+			_ = w.SetResponse(codes.BadRequest, message.TextPlain, nil)
+			return
+		}
+		// Dispatch based on request body content.
+		switch string(body) {
+		case "field=temperature":
+			_ = w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("22.5")))
+		case "field=humidity":
+			_ = w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("45%")))
+		default:
+			_ = w.SetResponse(codes.BadRequest, message.TextPlain, nil)
+		}
+	})
+	defer cleanup()
+
+	doFetch := func(body string) (codes.Code, string) {
+		cc, errD := udp.Dial(addr)
+		require.NoError(t, errD)
+		defer func() { _ = cc.Close(); <-cc.Done() }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+		defer cancel()
+
+		req, errR := cc.NewGetRequest(ctx, "/multi")
+		require.NoError(t, errR)
+		req.SetCode(codeFETCH)
+		req.SetContentFormat(message.TextPlain)
+		req.SetBody(bytes.NewReader([]byte(body)))
+
+		resp, errDo := cc.Do(req)
+		require.NoError(t, errDo)
+		b, _ := resp.ReadBody()
+		return resp.Code(), string(b)
+	}
+
+	code1, body1 := doFetch("field=temperature")
+	require.Equal(t, codes.Content, code1)
+	require.Equal(t, "22.5", body1)
+
+	code2, body2 := doFetch("field=humidity")
+	require.Equal(t, codes.Content, code2)
+	require.Equal(t, "45%", body2,
+		"RFC 8132 §2: server MUST use FETCH body to select the returned representation")
+}
+
+// TC_CoAP_FP_013 – TP_CoAP_PATCH_BodyReceived
+//
+// Reference: RFC 8132 Section 3
+// "A PATCH request carries a description of changes in the request payload."
+// The server MUST receive the full body of a PATCH request.
+//
+// Procedure: PATCH /config with body "key=debug&value=true".
+// Expected: server reads body correctly, responds 2.04 Changed.
+func TestTC_CoAP_FP_013_PATCH_BodyReceived(t *testing.T) {
+	var mu sync.Mutex
+	receivedBody := ""
+
+	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], r *pool.Message) {
+		if r.Code() != codePATCH {
+			_ = w.SetResponse(codes.MethodNotAllowed, message.TextPlain, nil)
+			return
+		}
+		body, errB := r.ReadBody()
+		if errB != nil {
+			_ = w.SetResponse(codes.BadRequest, message.TextPlain, nil)
+			return
+		}
+		mu.Lock()
+		receivedBody = string(body)
+		mu.Unlock()
+		_ = w.SetResponse(codes.Changed, message.TextPlain, nil)
+	})
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	req, err := cc.NewGetRequest(ctx, "/config")
+	require.NoError(t, err)
+	req.SetCode(codePATCH)
+	req.SetContentFormat(message.TextPlain)
+	req.SetBody(bytes.NewReader([]byte("key=debug&value=true")))
+
+	resp, err := cc.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, codes.Changed, resp.Code())
+
+	mu.Lock()
+	require.Equal(t, "key=debug&value=true", receivedBody,
+		"RFC 8132 §3: server MUST receive the full PATCH request body")
+	mu.Unlock()
+}

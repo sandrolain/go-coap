@@ -176,11 +176,22 @@ func New[C Client](
 	}
 }
 
+// bertMessageOverhead is a conservative estimate of non-payload bytes in a
+// CoAP TCP message: Code (1) + Token (≤8) + Options (≤64) + PayloadMarker (1).
+// Subtracting this from MaxMessageSize gives the maximum safe BERT payload.
+const bertMessageOverhead int64 = 128
+
 func bufferSize(szx SZX, maxMessageSize uint32) int64 {
 	if szx < SZXBERT {
 		return szx.Size()
 	}
-	return (int64(maxMessageSize) / szx.Size()) * szx.Size()
+	// For BERT (TCP-only), reserve space for message framing overhead so that
+	// the total CoAP message stays within the peer's advertised MaxMessageSize.
+	effective := int64(maxMessageSize) - bertMessageOverhead
+	if effective < szx.Size() {
+		return szx.Size()
+	}
+	return (effective / szx.Size()) * szx.Size()
 }
 
 // CheckExpirations iterates over caches and remove expired items.

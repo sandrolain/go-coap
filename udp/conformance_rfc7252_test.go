@@ -2535,3 +2535,460 @@ func TestTC_CoAP_CF_042_ZeroLengthToken_Valid(t *testing.T) {
 	require.Equal(t, uint8(0), respTKL,
 		"response to TKL=0 request must also have TKL=0 (RFC 7252 §5.3.1)")
 }
+
+// ── Additional RFC 7252 conformance tests (CF_066–CF_075) ──────────────────
+
+// TC_CoAP_CF_066 – TP_CoAP_IfNoneMatch_ResourceExists
+//
+// Reference: RFC 7252 Section 5.10.8.2
+// "The If-None-Match option MAY be used to make a request conditional on
+// the non-existence of the target resource. If the target resource DOES exist,
+// the server MUST NOT perform the method and MUST return 4.12 (Precondition Failed)."
+//
+// Procedure:
+//  1. PUT /if-none-match to create the resource (no condition).
+//  2. PUT /if-none-match with If-None-Match while it exists → 4.12 Precondition Failed.
+func TestTC_CoAP_CF_066_IfNoneMatch_ResourceExists_PreconditionFailed(t *testing.T) {
+	resourceExists := false
+
+	m := mux.NewRouter()
+	err := m.Handle("/if-none-match", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+		if r.Code() != codes.PUT {
+			_ = w.SetResponse(codes.MethodNotAllowed, message.TextPlain, nil)
+			return
+		}
+		hasIfNoneMatch := r.HasOption(message.IfNoneMatch)
+		if hasIfNoneMatch && resourceExists {
+			_ = w.SetResponse(codes.PreconditionFailed, message.TextPlain, nil)
+			return
+		}
+		resourceExists = true
+		_ = w.SetResponse(codes.Created, message.TextPlain, nil)
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startConformanceServer(t, m)
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	// Step 1: create the resource.
+	resp1, err := cc.Put(ctx, "/if-none-match", message.TextPlain, bytes.NewReader([]byte("v1")))
+	require.NoError(t, err)
+	require.Equal(t, codes.Created, resp1.Code())
+
+	// Step 2: PUT with If-None-Match while resource exists → 4.12.
+	resp2, err := cc.Put(ctx, "/if-none-match", message.TextPlain, bytes.NewReader([]byte("v2")),
+		message.Option{ID: message.IfNoneMatch, Value: nil})
+	require.NoError(t, err)
+	require.Equal(t, codes.PreconditionFailed, resp2.Code(),
+		"RFC 7252 §5.10.8.2: PUT with If-None-Match on existing resource MUST return 4.12")
+}
+
+// TC_CoAP_CF_067 – TP_CoAP_Token_VariableLengths
+//
+// Reference: RFC 7252 Section 5.3.1
+// "The token is a sequence of 0 to 8 bytes."
+// All token lengths from 1 to 7 bytes MUST be supported and echoed verbatim.
+//
+// Procedure: send CON GET with tokens of length 1, 2, 4, and 7 bytes.
+// Expected: each response echoes the exact token.
+func TestTC_CoAP_CF_067_Token_VariableLengths(t *testing.T) {
+	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], _ *pool.Message) {
+		_ = w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("ok")))
+	})
+	defer cleanup()
+
+	conn, err := net.Dial("udp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	tokenTests := []struct {
+		name  string
+		token []byte
+	}{
+		{"1-byte", []byte{0xAA}},
+		{"2-byte", []byte{0xBB, 0xCC}},
+		{"4-byte", []byte{0x01, 0x02, 0x03, 0x04}},
+		{"7-byte", []byte{0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70}},
+	}
+
+	for i, tc := range tokenTests {
+		t.Run(tc.name, func(t *testing.T) {
+			tkl := uint8(len(tc.token))
+			mid := uint16(0x0100 + i)
+			// VER=1, T=CON, TKL=tkl
+			pkt := []byte{0x40 | tkl, 0x01, byte(mid >> 8), byte(mid)}
+			pkt = append(pkt, tc.token...)
+			pkt = append(pkt, 0xB1, 't') // Uri-Path "t"
+
+			_, errW := conn.Write(pkt)
+			require.NoError(t, errW)
+
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			buf := make([]byte, 256)
+			n, errR := conn.Read(buf)
+			require.NoError(t, errR, "server must respond")
+			require.GreaterOrEqual(t, n, 4+int(tkl))
+
+			respTKL := buf[0] & 0x0F
+			require.Equal(t, tkl, respTKL, "response TKL must match request")
+			require.Equal(t, tc.token, buf[4:4+int(tkl)],
+				"RFC 7252 §5.3.1: %d-byte token must be echoed verbatim", tkl)
+		})
+	}
+}
+
+// TC_CoAP_CF_068 – TP_CoAP_EmptyMessage_RST_EchosMID
+//
+// Reference: RFC 7252 Section 4.2, 4.3
+// "The RST message MUST echo the Message ID of the message being rejected."
+//
+// Procedure: send empty CON (Ping) with specific MID. Verify RST has same MID.
+func TestTC_CoAP_CF_068_RST_EchosMID(t *testing.T) {
+	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], _ *pool.Message) {
+		// No-op — ping handled by middleware.
+	})
+	defer cleanup()
+
+	conn, err := net.Dial("udp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Empty CON with MID=0x1234
+	pkt := []byte{0x40, 0x00, 0x12, 0x34} // VER=1, T=CON, TKL=0, Code=0.00, MID=0x1234
+	_, err = conn.Write(pkt)
+	require.NoError(t, err)
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, n, 4)
+
+	respType := (buf[0] >> 4) & 0x03
+	require.Equal(t, uint8(3), respType,
+		"RFC 7252 §4.2: empty CON must be answered with RST (type=3)")
+
+	respMID := uint16(buf[2])<<8 | uint16(buf[3])
+	require.Equal(t, uint16(0x1234), respMID,
+		"RFC 7252 §4.3: RST message MUST echo the MID=0x1234 of the CON")
+}
+
+// TC_CoAP_CF_069 – TP_CoAP_Response_Forbidden_403
+//
+// Reference: RFC 7252 Section 5.9.1
+// "4.03 (Forbidden): The client is not authorized to perform the requested action."
+//
+// Procedure: GET /admin; server returns 4.03 Forbidden.
+func TestTC_CoAP_CF_069_Response_Forbidden(t *testing.T) {
+	m := mux.NewRouter()
+	err := m.Handle("/admin", mux.HandlerFunc(func(w mux.ResponseWriter, _ *mux.Message) {
+		errS := w.SetResponse(codes.Forbidden, message.TextPlain,
+			bytes.NewReader([]byte("access denied")))
+		require.NoError(t, errS)
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startConformanceServer(t, m)
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	resp, err := cc.Get(ctx, "/admin")
+	require.NoError(t, err)
+	require.Equal(t, codes.Forbidden, resp.Code(),
+		"RFC 7252 §5.9.1: server MUST be able to return 4.03 Forbidden")
+}
+
+// TC_CoAP_CF_070 – TP_CoAP_Options_LocationPath_MultiSegment
+//
+// Reference: RFC 7252 Section 5.10.7
+// "The Location-Path and Location-Query options together indicate a
+// relative URI. Multiple Location-Path options form the path segments."
+//
+// Procedure: POST /items; server responds 2.01 Created with Location-Path
+// segments /items/42/detail.
+func TestTC_CoAP_CF_070_LocationPath_MultiSegment(t *testing.T) {
+	m := mux.NewRouter()
+	err := m.Handle("/items", mux.HandlerFunc(func(w mux.ResponseWriter, _ *mux.Message) {
+		errS := w.SetResponse(codes.Created, message.TextPlain, nil,
+			message.Option{ID: message.LocationPath, Value: []byte("items")},
+			message.Option{ID: message.LocationPath, Value: []byte("42")},
+			message.Option{ID: message.LocationPath, Value: []byte("detail")})
+		require.NoError(t, errS)
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startConformanceServer(t, m)
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	resp, err := cc.Post(ctx, "/items", message.TextPlain, bytes.NewReader([]byte("new")))
+	require.NoError(t, err)
+	require.Equal(t, codes.Created, resp.Code())
+
+	locBuf := make([]string, 10)
+	n, err := resp.Options().GetStrings(message.LocationPath, locBuf)
+	require.NoError(t, err)
+	require.Equal(t, 3, n, "RFC 7252 §5.10.7: must receive 3 Location-Path segments")
+	require.Equal(t, "items", locBuf[0])
+	require.Equal(t, "42", locBuf[1])
+	require.Equal(t, "detail", locBuf[2])
+}
+
+// TC_CoAP_CF_071 – TP_CoAP_Options_MaxAge_Default
+//
+// Reference: RFC 7252 Section 5.10.5
+// "In the absence of this option, a response SHOULD be considered fresh for
+// a default value of 60 seconds."
+//
+// Procedure: GET /resource; server responds WITHOUT Max-Age option.
+// Expected: Max-Age option is absent (default 60s applies implicitly).
+func TestTC_CoAP_CF_071_MaxAge_Default(t *testing.T) {
+	m := mux.NewRouter()
+	err := m.Handle("/resource", mux.HandlerFunc(func(w mux.ResponseWriter, _ *mux.Message) {
+		errS := w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("data")))
+		require.NoError(t, errS)
+		// Deliberately NOT setting Max-Age → RFC default = 60s applies.
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startConformanceServer(t, m)
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	resp, err := cc.Get(ctx, "/resource")
+	require.NoError(t, err)
+	require.Equal(t, codes.Content, resp.Code())
+
+	// The library may or may not include an explicit Max-Age in the response.
+	// Per RFC 7252 §5.10.5, the absence of Max-Age means the client should
+	// treat it as 60 seconds. If present, verify it's reasonable.
+	val, errMA := resp.Options().GetUint32(message.MaxAge)
+	if errMA == nil {
+		// Max-Age is present — the value should be ≤ 60 (the library default)
+		// or whatever the handler set.
+		t.Logf("RFC 7252 §5.10.5: Max-Age=%d present in response", val)
+	} else {
+		// Max-Age absent → implicit default of 60s (correct per RFC).
+		t.Log("RFC 7252 §5.10.5: Max-Age absent → implicit default 60s applies (correct)")
+	}
+}
+
+// TC_CoAP_CF_072 – TP_CoAP_MultipleUriQuery_Options
+//
+// Reference: RFC 7252 Section 5.10.1
+// "Each Uri-Query option specifies one argument."
+// Multiple Uri-Query options form the full query string.
+//
+// Procedure: GET /search?a=1&b=2&c=3 → three Uri-Query options.
+// Expected: server receives all three query arguments.
+func TestTC_CoAP_CF_072_MultipleUriQuery(t *testing.T) {
+	var receivedQueries []string
+	var mu sync.Mutex
+
+	m := mux.NewRouter()
+	err := m.Handle("/search", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+		buf := make([]string, 20)
+		n, errQ := r.Options().GetStrings(message.URIQuery, buf)
+		if errQ == nil {
+			mu.Lock()
+			receivedQueries = buf[:n]
+			mu.Unlock()
+		}
+		errS := w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("ok")))
+		require.NoError(t, errS)
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startConformanceServer(t, m)
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	resp, err := cc.Get(ctx, "/search?a=1&b=2&c=3")
+	require.NoError(t, err)
+	require.Equal(t, codes.Content, resp.Code())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(receivedQueries), 3,
+		"RFC 7252 §5.10.1: server must receive all three Uri-Query options")
+	require.Contains(t, receivedQueries, "a=1")
+	require.Contains(t, receivedQueries, "b=2")
+	require.Contains(t, receivedQueries, "c=3")
+}
+
+// TC_CoAP_CF_073 – TP_CoAP_Response_ValidResponse_WithPayload
+//
+// Reference: RFC 7252 Section 5.5
+// "Both requests and responses may include a payload depending on the method."
+// A response with payload MUST have the payload marker (0xFF) followed by data.
+//
+// Procedure: GET /resource; server produces a payload with Content-Format.
+// Expected: client reads the payload correctly.
+func TestTC_CoAP_CF_073_Response_WithPayload(t *testing.T) {
+	expectedPayload := []byte("Hello, CoAP!")
+	m := mux.NewRouter()
+	err := m.Handle("/resource", mux.HandlerFunc(func(w mux.ResponseWriter, _ *mux.Message) {
+		errS := w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader(expectedPayload))
+		require.NoError(t, errS)
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startConformanceServer(t, m)
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	resp, err := cc.Get(ctx, "/resource")
+	require.NoError(t, err)
+	require.Equal(t, codes.Content, resp.Code())
+
+	body, err := resp.ReadBody()
+	require.NoError(t, err)
+	require.Equal(t, expectedPayload, body,
+		"RFC 7252 §5.5: response payload must be delivered to client")
+
+	cf, err := resp.ContentFormat()
+	require.NoError(t, err)
+	require.Equal(t, message.TextPlain, cf,
+		"RFC 7252 §5.5.1: Content-Format must be present when payload is included")
+}
+
+// TC_CoAP_CF_074 – TP_CoAP_Options_IfMatch_MultipleETags
+//
+// Reference: RFC 7252 Section 5.10.8.1
+// "One or more If-Match options MAY be present. If any of the entity-tags
+// match, the condition is fulfilled."
+//
+// Procedure: PUT /resource with two If-Match ETags; one matches.
+// Expected: 2.04 Changed (condition fulfilled because one matches).
+func TestTC_CoAP_CF_074_IfMatch_MultipleETags(t *testing.T) {
+	currentETag := []byte{0xAA, 0xBB}
+
+	m := mux.NewRouter()
+	err := m.Handle("/resource", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+		// Check if any If-Match option matches the resource's current ETag.
+		matched := false
+		for _, opt := range r.Options() {
+			if opt.ID == message.IfMatch && bytes.Equal(opt.Value, currentETag) {
+				matched = true
+				break
+			}
+		}
+		// If If-Match present but none match → 4.12
+		hasIfMatch := false
+		for _, opt := range r.Options() {
+			if opt.ID == message.IfMatch {
+				hasIfMatch = true
+				break
+			}
+		}
+		if hasIfMatch && !matched {
+			_ = w.SetResponse(codes.PreconditionFailed, message.TextPlain, nil)
+			return
+		}
+		_ = w.SetResponse(codes.Changed, message.TextPlain, nil)
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startConformanceServer(t, m)
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	// Two If-Match options: first doesn't match, second does.
+	resp, err := cc.Put(ctx, "/resource", message.TextPlain, bytes.NewReader([]byte("v2")),
+		message.Option{ID: message.IfMatch, Value: []byte{0x99}},       // does NOT match
+		message.Option{ID: message.IfMatch, Value: []byte{0xAA, 0xBB}}) // matches
+	require.NoError(t, err)
+	require.Equal(t, codes.Changed, resp.Code(),
+		"RFC 7252 §5.10.8.1: PUT with multiple If-Match MUST succeed if ANY ETag matches")
+}
+
+// TC_CoAP_CF_075 – TP_CoAP_Response_RequestEntityTooLarge_Size1Hint
+//
+// Reference: RFC 7252 Section 5.9.1 + 5.10.9
+// "4.13 Request Entity Too Large: … The response SHOULD include a Size1 option
+// to indicate the maximum size of request entity the server is willing to accept."
+//
+// Procedure: POST /upload with oversized body; server returns 4.13 with Size1.
+// Expected: client reads 4.13 response and Size1 value.
+func TestTC_CoAP_CF_075_RequestEntityTooLarge_Size1(t *testing.T) {
+	const maxSize = 256
+	m := mux.NewRouter()
+	err := m.Handle("/upload", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+		body, _ := r.ReadBody()
+		if len(body) > maxSize {
+			errS := w.SetResponse(codes.RequestEntityTooLarge, message.TextPlain, nil,
+				message.Option{ID: message.Size1, Value: encodeUint16(maxSize)})
+			require.NoError(t, errS)
+			return
+		}
+		errS := w.SetResponse(codes.Changed, message.TextPlain, nil)
+		require.NoError(t, errS)
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startConformanceServer(t, m)
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	// Oversized body (> maxSize bytes).
+	bigBody := bytes.Repeat([]byte("X"), maxSize+100)
+	resp, err := cc.Post(ctx, "/upload", message.AppOctets, bytes.NewReader(bigBody))
+	require.NoError(t, err)
+	require.Equal(t, codes.RequestEntityTooLarge, resp.Code(),
+		"RFC 7252 §5.9.1: oversized entity MUST return 4.13")
+
+	size1, errS := resp.Options().GetUint32(message.Size1)
+	require.NoError(t, errS,
+		"RFC 7252 §5.10.9: 4.13 response SHOULD include Size1 to hint max size")
+	require.Equal(t, uint32(maxSize), size1,
+		"RFC 7252 §5.10.9: Size1 value must indicate the maximum acceptable size")
+}

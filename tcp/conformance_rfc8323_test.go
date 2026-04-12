@@ -773,3 +773,185 @@ func TestTC_CoAP_TCP_017_BERT_LargeTransfer(t *testing.T) {
 	_ = assert.Equal(t, payloadSize, len(receivedBody),
 		"RFC 8323 §6: received payload length must match original")
 }
+
+// ── Additional RFC 8323 conformance tests (TCP_018–TCP_020) ──────
+
+// TC_CoAP_TCP_018 – TP_CoAP_TCP_CSM_MaxMessageSize
+//
+// Reference: RFC 8323 Section 5.3.1
+// "The Max-Message-Size option indicates the maximum message size
+//
+//	the sender is able to receive."
+//
+// Procedure: connect client with a specific MaxMessageSize,
+//
+//	request a resource whose response fits within the limit.
+//
+// Expected:  response is received successfully.
+func TestTC_CoAP_TCP_018_CSM_MaxMessageSize(t *testing.T) {
+	const maxMsgSize = 8192
+
+	r := mux.NewRouter()
+	err := r.Handle("/csm-test", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+		data := make([]byte, 4096)
+		for i := range data {
+			data[i] = byte(i & 0xFF)
+		}
+		_ = w.SetResponse(codes.Content, message.AppOctets, bytes.NewReader(data))
+	}))
+	require.NoError(t, err)
+
+	l, err := coapNet.NewTCPListener("tcp", "")
+	require.NoError(t, err)
+
+	s := NewServer(
+		options.WithMux(r),
+		options.WithMaxMessageSize(uint32(maxMsgSize)),
+	)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = s.Serve(l)
+	}()
+	defer func() {
+		s.Stop()
+		wg.Wait()
+		_ = l.Close()
+	}()
+
+	cc, err := Dial(l.Addr().String(),
+		options.WithMaxMessageSize(uint32(maxMsgSize)),
+	)
+	require.NoError(t, err, "RFC 8323 §5.3.1: TCP connection with MaxMessageSize must succeed")
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tcpConformanceTimeout)
+	defer cancel()
+
+	resp, err := cc.Get(ctx, "/csm-test")
+	require.NoError(t, err, "RFC 8323 §5.3.1: GET within MaxMessageSize must succeed")
+	require.Equal(t, codes.Content, resp.Code())
+
+	body, err := resp.ReadBody()
+	require.NoError(t, err)
+	require.Len(t, body, 4096,
+		"RFC 8323 §5.3.1: response body must arrive intact when within MaxMessageSize limit")
+}
+
+// TC_CoAP_TCP_019 – TP_CoAP_TCP_POST_LargeBody
+//
+// Reference: RFC 8323 Section 3.3
+// "The lengths are expressed in the length field of the CoAP message
+//
+//	header and there is no separate payload marker."
+//
+// Procedure: client POSTs a payload larger than one TCP segment
+//
+//	(without blockwise, using MaxMessageSize large enough).
+//
+// Expected:  server receives the entire payload.
+func TestTC_CoAP_TCP_019_POST_LargeBody(t *testing.T) {
+	const payloadSize = 16384
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+
+	var receivedBody []byte
+	var mu sync.Mutex
+
+	addr, cleanup := startTCPConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], r *pool.Message) {
+		body, errR := r.ReadBody()
+		if errR == nil {
+			mu.Lock()
+			receivedBody = body
+			mu.Unlock()
+		}
+		_ = w.SetResponse(codes.Created, message.TextPlain, bytes.NewReader([]byte("created")))
+	})
+	defer cleanup()
+
+	cc, err := Dial(addr,
+		options.WithMaxMessageSize(uint32(payloadSize*2)),
+	)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tcpConformanceTimeout)
+	defer cancel()
+
+	resp, err := cc.Post(ctx, "/large-write", message.AppOctets, bytes.NewReader(payload))
+	require.NoError(t, err, "RFC 8323 §3.3: POST with large body over TCP must succeed")
+	require.Equal(t, codes.Created, resp.Code())
+
+	mu.Lock()
+	require.Equal(t, payload, receivedBody,
+		"RFC 8323 §3.3: server must receive the full %d-byte payload", payloadSize)
+	mu.Unlock()
+}
+
+// TC_CoAP_TCP_020 – TP_CoAP_TCP_ConcurrentRequests
+//
+// Reference: RFC 8323 Section 3.4
+// "Responses are not strictly required to arrive in the same order
+//
+//	as the requests."
+//
+// Procedure: client sends multiple in-flight requests concurrently.
+// Expected:  all responses are received correctly (matched by token).
+func TestTC_CoAP_TCP_020_ConcurrentRequests(t *testing.T) {
+	r := mux.NewRouter()
+	err := r.Handle("/concurrent", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+		_ = w.SetResponse(codes.Content, message.TextPlain,
+			bytes.NewReader([]byte("pong")))
+	}))
+	require.NoError(t, err)
+
+	l, err := coapNet.NewTCPListener("tcp", "")
+	require.NoError(t, err)
+
+	s := NewServer(options.WithMux(r))
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = s.Serve(l)
+	}()
+	defer func() {
+		s.Stop()
+		wg.Wait()
+		_ = l.Close()
+	}()
+
+	cc, err := Dial(l.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tcpConformanceTimeout)
+	defer cancel()
+
+	const numRequests = 10
+	results := make(chan error, numRequests)
+
+	for i := 0; i < numRequests; i++ {
+		go func() {
+			resp, errG := cc.Get(ctx, "/concurrent")
+			if errG != nil {
+				results <- errG
+				return
+			}
+			if resp.Code() != codes.Content {
+				results <- assert.AnError
+				return
+			}
+			results <- nil
+		}()
+	}
+
+	for i := 0; i < numRequests; i++ {
+		err := <-results
+		require.NoError(t, err,
+			"RFC 8323 §3.4: concurrent request %d must succeed", i+1)
+	}
+}
