@@ -1091,3 +1091,253 @@ func TestTC_CoAP_CF_041_Observe_Cancellation(t *testing.T) {
 	require.True(t, obs.Canceled(),
 		"observation must be marked as canceled after Cancel()")
 }
+
+// ── Additional RFC 7641 conformance tests (OB_014–OB_016) ──────
+
+// TC_CoAP_OB_014 – TP_CoAP_Observe_MaxAge_Expiration
+//
+// Reference: RFC 7641 Section 4.5
+// "When Max-Age expires, the notification is no longer fresh. A new
+// notification should be sent by the server to keep the client updated."
+//
+// Procedure: server sends notification with Max-Age=1, then after a short
+// sleep sends another notification. Client receives both.
+// Expected: client receives a second (fresh) notification after the first.
+func TestTC_CoAP_OB_014_MaxAge_Expiration(t *testing.T) {
+	type notif struct {
+		seq    uint32
+		maxAge uint32
+	}
+	notifCh := make(chan notif, 5)
+
+	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], r *pool.Message) {
+		obs, errO := r.Observe()
+		if errO != nil {
+			_ = w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("v0")))
+			return
+		}
+		switch obs {
+		case 0:
+			cc := w.Conn()
+			tok := make([]byte, len(r.Token()))
+			copy(tok, r.Token())
+			go func() {
+				// Notification 1: Max-Age=1 (expires in 1s)
+				req := cc.AcquireMessage(cc.Context())
+				req.SetCode(codes.Content)
+				req.SetContentFormat(message.TextPlain)
+				req.SetObserve(2)
+				req.SetOptionUint32(message.MaxAge, 1)
+				req.SetBody(bytes.NewReader([]byte("temp=20")))
+				req.SetToken(tok)
+				_ = cc.WriteMessage(req)
+				cc.ReleaseMessage(req)
+
+				// Wait for Max-Age to expire, then send fresh notification
+				time.Sleep(1200 * time.Millisecond)
+
+				req2 := cc.AcquireMessage(cc.Context())
+				req2.SetCode(codes.Content)
+				req2.SetContentFormat(message.TextPlain)
+				req2.SetObserve(3)
+				req2.SetOptionUint32(message.MaxAge, 60)
+				req2.SetBody(bytes.NewReader([]byte("temp=21")))
+				req2.SetToken(tok)
+				_ = cc.WriteMessage(req2)
+				cc.ReleaseMessage(req2)
+			}()
+		case 1:
+			_ = w.SetResponse(codes.Content, message.TextPlain, nil)
+		}
+	})
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	obs, err := cc.Observe(ctx, "/temp-sensor", func(msg *pool.Message) {
+		seq, errO := msg.Observe()
+		if errO != nil {
+			return
+		}
+		ma, errMA := msg.Options().GetUint32(message.MaxAge)
+		if errMA != nil {
+			ma = 60 // default
+		}
+		select {
+		case notifCh <- notif{seq: seq, maxAge: ma}:
+		default:
+		}
+	})
+	require.NoError(t, err)
+	defer func() {
+		if obs != nil {
+			_ = obs.Cancel(ctx)
+		}
+	}()
+
+	// Collect both notifications
+	var received []notif
+	deadline := time.After(5 * time.Second)
+	for len(received) < 2 {
+		select {
+		case n := <-notifCh:
+			received = append(received, n)
+		case <-deadline:
+			require.FailNow(t, "RFC 7641 §4.5: timed out waiting for notifications after Max-Age expiry",
+				"got %d of 2", len(received))
+		}
+	}
+
+	require.Equal(t, uint32(1), received[0].maxAge,
+		"RFC 7641 §4.5: first notification Max-Age must be 1")
+	require.Greater(t, received[1].seq, received[0].seq,
+		"RFC 7641 §4.5: second notification must have higher sequence number")
+}
+
+// TC_CoAP_OB_015 – TP_CoAP_Observe_Reordering_ClockBased
+//
+// Reference: RFC 7641 Section 3.4
+// "V1 is fresher than V2 either if V1 > V2 (modular comparison within
+// 2^23) and the notification was received within 128 seconds of the
+// last fresh notification, OR if it was received more than 128 seconds
+// after the last fresh notification (regardless of sequence number)."
+//
+// Procedure: server sends seq=10, seq=8 (stale, within 128s), seq=12 (fresh).
+// Expected: client discards seq=8, receives only seq=10 and seq=12.
+func TestTC_CoAP_OB_015_Reordering_ClockBased(t *testing.T) {
+	notifSeqs := make(chan uint32, 10)
+
+	addr, cleanup := startConformanceServerWithHandler(t, func(w *responsewriter.ResponseWriter[*client.Conn], r *pool.Message) {
+		obs, errO := r.Observe()
+		if errO != nil {
+			_ = w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("v0")))
+			return
+		}
+		switch obs {
+		case 0:
+			cc := w.Conn()
+			tok := make([]byte, len(r.Token()))
+			copy(tok, r.Token())
+			go func() {
+				// seq=10 (fresh), seq=8 (stale: 8 < 10 within 128s), seq=12 (fresh)
+				for _, seq := range []uint32{10, 8, 12} {
+					req := cc.AcquireMessage(cc.Context())
+					req.SetCode(codes.Content)
+					req.SetContentFormat(message.TextPlain)
+					req.SetObserve(seq)
+					req.SetBody(bytes.NewReader([]byte("v")))
+					req.SetToken(tok)
+					_ = cc.WriteMessage(req)
+					cc.ReleaseMessage(req)
+					time.Sleep(20 * time.Millisecond)
+				}
+			}()
+		case 1:
+			_ = w.SetResponse(codes.Content, message.TextPlain, nil)
+		}
+	})
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+
+	obs, err := cc.Observe(ctx, "/reorder", func(msg *pool.Message) {
+		seq, errO := msg.Observe()
+		if errO == nil {
+			notifSeqs <- seq
+		}
+	})
+	require.NoError(t, err)
+	defer func() {
+		if obs != nil {
+			_ = obs.Cancel(ctx)
+		}
+	}()
+
+	var received []uint32
+	deadline := time.After(2 * time.Second)
+collect:
+	for {
+		select {
+		case seq := <-notifSeqs:
+			received = append(received, seq)
+		case <-deadline:
+			break collect
+		}
+	}
+
+	require.Equal(t, 2, len(received),
+		"RFC 7641 §3.4: stale notification (seq=8 after seq=10) must be discarded; got %v", received)
+	require.Equal(t, uint32(10), received[0])
+	require.Equal(t, uint32(12), received[1])
+}
+
+// TC_CoAP_OB_016 – TP_CoAP_Observe_Blockwise_LargeNotification
+//
+// Reference: RFC 7959 Section 2.9 + RFC 7641
+// "When a resource is too large for a single message, blockwise transfer
+// can be combined with observe."
+//
+// Procedure: register for /large-sensor (4KB payload), server sends notifications
+// with blockwise transfer.
+// Expected: client receives full payload via blockwise.
+func TestTC_CoAP_OB_016_Blockwise_LargeNotification(t *testing.T) {
+	const payloadSize = 4096
+	largePayload := make([]byte, payloadSize)
+	for i := range largePayload {
+		largePayload[i] = byte(i % 251)
+	}
+
+	bodyCh := make(chan []byte, 2)
+
+	r := mux.NewRouter()
+	err := r.Handle("/large-sensor", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+		_ = w.SetResponse(codes.Content, message.AppOctets, bytes.NewReader(largePayload))
+	}))
+	require.NoError(t, err)
+
+	_, addr, cleanup := startConformanceServer(t, r)
+	defer cleanup()
+
+	cc, err := udp.Dial(addr)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	obs, err := cc.Observe(ctx, "/large-sensor", func(msg *pool.Message) {
+		body, errR := msg.ReadBody()
+		if errR == nil && len(body) > 0 {
+			select {
+			case bodyCh <- body:
+			default:
+			}
+		}
+	})
+	require.NoError(t, err,
+		"RFC 7959 §2.9 + RFC 7641: observe with blockwise must succeed")
+	defer func() {
+		if obs != nil {
+			_ = obs.Cancel(ctx)
+		}
+	}()
+
+	select {
+	case body := <-bodyCh:
+		require.Equal(t, largePayload, body,
+			"RFC 7959 §2.9: large observe notification (%d bytes) must be received intact via blockwise",
+			payloadSize)
+	case <-time.After(8 * time.Second):
+		require.FailNow(t, "RFC 7959 §2.9 + RFC 7641: timed out waiting for blockwise observe notification")
+	}
+}

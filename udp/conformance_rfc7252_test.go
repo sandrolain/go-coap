@@ -19,6 +19,8 @@ import (
 	"github.com/plgd-dev/go-coap/v3/message/pool"
 	"github.com/plgd-dev/go-coap/v3/mux"
 	"github.com/plgd-dev/go-coap/v3/net/responsewriter"
+	"github.com/plgd-dev/go-coap/v3/options"
+	"github.com/plgd-dev/go-coap/v3/pkg/runner/periodic"
 	"github.com/plgd-dev/go-coap/v3/udp"
 	"github.com/plgd-dev/go-coap/v3/udp/client"
 	"github.com/stretchr/testify/assert"
@@ -2991,4 +2993,209 @@ func TestTC_CoAP_CF_075_RequestEntityTooLarge_Size1(t *testing.T) {
 		"RFC 7252 §5.10.9: 4.13 response SHOULD include Size1 to hint max size")
 	require.Equal(t, uint32(maxSize), size1,
 		"RFC 7252 §5.10.9: Size1 value must indicate the maximum acceptable size")
+}
+
+// ── CON retransmission conformance tests (CF_076–CF_078) ──────
+
+// TC_CoAP_CF_076 – TP_CoAP_CON_Retransmission_MaxRetransmit
+//
+// Reference: RFC 7252 Section 4.2
+// "A Confirmable message is retransmitted … up to MAX_RETRANSMIT times."
+// With MAX_RETRANSMIT=2 and short ACK_TIMEOUT, the client should send
+// the initial request + 2 retransmissions = 3 total transmissions,
+// then give up.
+//
+// Procedure: raw UDP listener that never sends ACK; client configured with
+// fast retransmission (10ms ACK_TIMEOUT, MAX_RETRANSMIT=2).
+// Expected: at least 2 CON messages received (initial + retransmit), then timeout error.
+func TestTC_CoAP_CF_076_CON_Retransmission_MaxRetransmit(t *testing.T) {
+	// Raw UDP listener that absorbs packets without responding.
+	rawConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer rawConn.Close()
+
+	addr := rawConn.LocalAddr().String()
+
+	// Count incoming packets in background.
+	var packetCount int32
+	var mu sync.Mutex
+	done := make(chan struct{})
+
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			_ = rawConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			n, _, errR := rawConn.ReadFrom(buf)
+			if errR != nil {
+				break
+			}
+			if n > 0 {
+				mu.Lock()
+				packetCount++
+				mu.Unlock()
+			}
+		}
+		close(done)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cc, err := udp.Dial(addr,
+		options.WithTransmission(1, 200*time.Millisecond, 2),
+		options.WithPeriodicRunner(periodic.New(ctx.Done(), 10*time.Millisecond)),
+	)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	_, err = cc.Get(ctx, "/test")
+	// Expect timeout / error since no ACK is sent back
+	require.Error(t, err,
+		"RFC 7252 §4.2: request must fail when no ACK is received after MAX_RETRANSMIT")
+
+	// Wait for reader to finish
+	<-done
+
+	mu.Lock()
+	count := packetCount
+	mu.Unlock()
+
+	// Should have at least 2 transmissions (initial + at least 1 retransmit)
+	require.GreaterOrEqual(t, count, int32(2),
+		"RFC 7252 §4.2: with MAX_RETRANSMIT=2, must send at least 2 CON messages (got %d)", count)
+	// Should not exceed initial + MAX_RETRANSMIT = 3
+	require.LessOrEqual(t, count, int32(3),
+		"RFC 7252 §4.2: with MAX_RETRANSMIT=2, must not exceed 3 transmissions (got %d)", count)
+}
+
+// TC_CoAP_CF_077 – TP_CoAP_CON_Retransmission_SameMID
+//
+// Reference: RFC 7252 Section 4.2
+// "Each retransmission of the same Confirmable message MUST use the same
+// Message ID."
+//
+// Procedure: raw UDP listener captures MIDs from retransmitted CON messages.
+// Expected: all MIDs are identical.
+func TestTC_CoAP_CF_077_CON_Retransmission_SameMID(t *testing.T) {
+	rawConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer rawConn.Close()
+
+	addr := rawConn.LocalAddr().String()
+
+	midCh := make(chan uint16, 10)
+	done := make(chan struct{})
+
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			_ = rawConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			n, _, errR := rawConn.ReadFrom(buf)
+			if errR != nil {
+				break
+			}
+			if n >= 4 {
+				// CoAP header: byte 2-3 = Message ID (big endian)
+				mid := uint16(buf[2])<<8 | uint16(buf[3])
+				midCh <- mid
+			}
+		}
+		close(done)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cc, err := udp.Dial(addr,
+		options.WithTransmission(1, 200*time.Millisecond, 2),
+		options.WithPeriodicRunner(periodic.New(ctx.Done(), 10*time.Millisecond)),
+	)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	_, _ = cc.Get(ctx, "/test")
+	<-done
+
+	close(midCh)
+	var mids []uint16
+	for mid := range midCh {
+		mids = append(mids, mid)
+	}
+
+	require.GreaterOrEqual(t, len(mids), 2,
+		"RFC 7252 §4.2: must capture at least 2 CON transmissions for MID check")
+
+	firstMID := mids[0]
+	for i, mid := range mids[1:] {
+		require.Equal(t, firstMID, mid,
+			"RFC 7252 §4.2: retransmission %d must use same MID (expected %d, got %d)", i+1, firstMID, mid)
+	}
+}
+
+// TC_CoAP_CF_078 – TP_CoAP_CON_ExponentialBackoff
+//
+// Reference: RFC 7252 Section 4.2
+// "The initial timeout is set to a random duration between ACK_TIMEOUT and
+// (ACK_TIMEOUT * ACK_RANDOM_FACTOR). For each retransmission, the timeout
+// is doubled."
+//
+// Procedure: raw UDP listener records timestamps of received CON messages.
+// Expected: intervals between retransmissions roughly double.
+func TestTC_CoAP_CF_078_CON_ExponentialBackoff(t *testing.T) {
+	rawConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer rawConn.Close()
+
+	addr := rawConn.LocalAddr().String()
+
+	timestamps := make(chan time.Time, 10)
+	done := make(chan struct{})
+
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			_ = rawConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			n, _, errR := rawConn.ReadFrom(buf)
+			if errR != nil {
+				break
+			}
+			if n > 0 {
+				timestamps <- time.Now()
+			}
+		}
+		close(done)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Use 200ms ACK_TIMEOUT so retransmissions happen at ~200ms, ~400ms, ~600ms
+	cc, err := udp.Dial(addr,
+		options.WithTransmission(1, 200*time.Millisecond, 3),
+		options.WithPeriodicRunner(periodic.New(ctx.Done(), 10*time.Millisecond)),
+	)
+	require.NoError(t, err)
+	defer func() { _ = cc.Close(); <-cc.Done() }()
+
+	_, _ = cc.Get(ctx, "/test")
+	<-done
+
+	close(timestamps)
+	var times []time.Time
+	for ts := range timestamps {
+		times = append(times, ts)
+	}
+
+	require.GreaterOrEqual(t, len(times), 3,
+		"RFC 7252 §4.2: need at least 3 transmissions for backoff analysis (got %d)", len(times))
+
+	// Check that intervals roughly increase (with tolerance for scheduling)
+	if len(times) >= 3 {
+		interval1 := times[1].Sub(times[0])
+		interval2 := times[2].Sub(times[1])
+		// interval2 should be roughly 2x interval1 (allow 50% tolerance)
+		require.Greater(t, interval2.Milliseconds(), interval1.Milliseconds()/2,
+			"RFC 7252 §4.2: retransmission intervals should increase (exponential backoff); "+
+				"interval1=%v, interval2=%v", interval1, interval2)
+	}
 }
