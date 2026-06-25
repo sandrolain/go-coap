@@ -113,6 +113,10 @@ func (s *Server) closeConnection(cc *client.Conn) {
 	}
 }
 
+func (s *Server) shouldPropagateError(err error) bool {
+	return s.ctx.Err() == nil && !coapNet.IsCancelOrCloseError(err)
+}
+
 func (s *Server) Serve(l *coapNet.UDPConn) error {
 	if s.cfg.BlockwiseSZX > blockwise.SZX1024 {
 		return errors.New("invalid blockwiseSZX")
@@ -133,7 +137,6 @@ func (s *Server) Serve(l *coapNet.UDPConn) error {
 	}()
 
 	m := make([]byte, s.cfg.MaxMessageSize)
-	var wg sync.WaitGroup
 
 	s.cfg.PeriodicRunner(func(now time.Time) bool {
 		s.handleInactivityMonitors(now)
@@ -146,17 +149,10 @@ func (s *Server) Serve(l *coapNet.UDPConn) error {
 		var cm *coapNet.ControlMessage
 		n, err := l.ReadWithOptions(buf, coapNet.WithContext(s.ctx), coapNet.WithGetControlMessage(&cm), coapNet.WithGetRemoteAddr(&raddr))
 		if err != nil {
-			wg.Wait()
-
-			select {
-			case <-s.ctx.Done():
+			if !s.shouldPropagateError(err) {
 				return nil
-			default:
-				if coapNet.IsCancelOrCloseError(err) {
-					return nil
-				}
-				return err
 			}
+			return err
 		}
 		buf = buf[:n]
 
@@ -275,7 +271,7 @@ func getClose(cc *client.Conn) func() {
 	return closeFn
 }
 
-func getConnKey(raddr *net.UDPAddr, laddr *net.UDPAddr) string {
+func getConnKey(raddr, laddr *net.UDPAddr) string {
 	normalizedLocalAddr := *laddr
 	if len(normalizedLocalAddr.IP) > 0 && normalizedLocalAddr.IP.IsMulticast() {
 		// Multicast destination address does not identify a unique server-side source address.
@@ -283,7 +279,30 @@ func getConnKey(raddr *net.UDPAddr, laddr *net.UDPAddr) string {
 		normalizedLocalAddr.IP = nil
 		normalizedLocalAddr.Zone = ""
 	}
+	if len(normalizedLocalAddr.IP) > 0 && normalizedLocalAddr.IP.IsUnspecified() {
+		// Wildcard listener addresses (0.0.0.0 / ::) are placeholders and do not identify
+		// a concrete destination address selected by the kernel for outgoing packets.
+		normalizedLocalAddr.IP = nil
+		normalizedLocalAddr.Zone = ""
+	}
 	return raddr.String() + "-" + normalizedLocalAddr.String()
+}
+
+func localAddrCanFallbackToWildcard(laddr *net.UDPAddr) bool {
+	if laddr == nil || len(laddr.IP) == 0 {
+		return false
+	}
+	if laddr.IP.IsMulticast() || laddr.IP.IsUnspecified() {
+		return false
+	}
+	return true
+}
+
+func toWildcardLocalAddr(laddr *net.UDPAddr) *net.UDPAddr {
+	wildcard := *laddr
+	wildcard.IP = nil
+	wildcard.Zone = ""
+	return &wildcard
 }
 
 func (s *Server) getOrCreateConn(udpConn *coapNet.UDPConn, raddr *net.UDPAddr, laddr *net.UDPAddr) (cc *client.Conn, created bool) {
@@ -294,6 +313,16 @@ func (s *Server) getOrCreateConn(udpConn *coapNet.UDPConn, raddr *net.UDPAddr, l
 
 	if cc != nil {
 		return cc, false
+	}
+
+	// When a client connection is created via NewConn() on a wildcard-bound listener,
+	// it is keyed by wildcard local address. Incoming datagrams can carry the concrete
+	// destination address in control messages, so fallback keeps these packets on the
+	// same conn instead of creating a second server-side conn.
+	if localAddrCanFallbackToWildcard(laddr) {
+		if cc = s.conns[getConnKey(raddr, toWildcardLocalAddr(laddr))]; cc != nil {
+			return cc, false
+		}
 	}
 
 	createBlockWise := func(*client.Conn) *blockwise.BlockWise[*client.Conn] {
@@ -421,6 +450,7 @@ func (s *Server) getConn(l *coapNet.UDPConn, raddr *net.UDPAddr, laddr *net.UDPA
 //
 // Optional laddr may be used to pin a concrete local address when the listener is bound to a wildcard address.
 // If laddr is omitted or nil, listener's local address is used.
+// For wildcard listeners, incoming packets addressed to concrete local IPs are matched to this conn.
 func (s *Server) NewConn(addr *net.UDPAddr, laddr ...*net.UDPAddr) (*client.Conn, error) {
 	if len(laddr) > 1 {
 		return nil, fmt.Errorf("invalid number of local addresses: %d", len(laddr))
