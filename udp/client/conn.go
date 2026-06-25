@@ -814,7 +814,7 @@ func (cc *Conn) handleReq(w *responsewriter.ResponseWriter[*Conn], req *pool.Mes
 	reqMessageID := req.MessageID()
 	// RFC 7252 §5.4.1: if the message is a request and contains an unrecognized critical
 	// (odd-numbered) option, the server MUST return 4.02 Bad Option.
-	if reqCode := req.Code(); reqCode >= codes.GET && uint8(reqCode) <= 0x07 {
+	if reqCode := req.Code(); reqCode >= codes.GET && reqCode <= codes.IPATCH {
 		for _, opt := range req.Options() {
 			if uint32(opt.ID)%2 == 1 {
 				if _, known := message.CoapOptionDefs[opt.ID]; !known {
